@@ -25,7 +25,7 @@
 import gevent
 import logging
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib.metadata import distribution, PackageNotFoundError
 from treelib.exceptions import DuplicatedNodeIdError
 from typing import Any, cast, Iterable, Optional, TYPE_CHECKING, Union
@@ -205,20 +205,6 @@ class PointNode(EquipmentNode):
     def last_updated(self) -> datetime:
         return self.data['last_updated']
 
-    @property
-    def stale(self) -> bool:
-        if self.data['config'].stale_timeout is None:
-            return False
-        else:
-            now = get_aware_utc_now()
-            # TODO: Logic was duplicated to add a debug statement. Decide if a permanent info/warning is required
-            #  here or elsewhere and get rid of second check.
-            if now - self.last_updated > self.data['config'].stale_timeout:
-                _log.debug(f'{self.tag} is stale --- now: {now}, last_updated: {self.last_updated},'
-                           f' stale_timeout: {self.data["config"].stale_timeout}, interval: {self.polling_interval}')
-            return True if get_aware_utc_now() - self.last_updated > self.data['config'].stale_timeout else False
-
-
 class EquipmentTree(TopicTree):
     def __init__(self, agent, *args, **kwargs):
         super(EquipmentTree, self).__init__(root_name=agent.config.depth_first_base, node_class=EquipmentNode,
@@ -236,6 +222,8 @@ class EquipmentTree(TopicTree):
         root_config.publish_multi_breadth = agent.config.publish_multi_breadth
         root_config.publish_all_depth = agent.config.publish_all_depth
         root_config.publish_all_breadth = agent.config.publish_all_breadth
+        root_config.stale_timeout_configured = agent.config.stale_timeout_configured
+        root_config.stale_timeout_multiplier = agent.config.stale_timeout_multiplier
         root_config.strict_all_publishes = agent.config.strict_all_publishes
 
     if TYPE_CHECKING:
@@ -428,6 +416,14 @@ class EquipmentTree(TopicTree):
     def get_polling_interval(self, nid: str) -> float:
         return self[next(self.rsearch(nid, lambda n: n.polling_interval is not None))].polling_interval
 
+    def get_stale_timeout_configured(self, nid: str) -> float | None:
+        node_with_value = next(self.rsearch(nid, lambda n: n.config.stale_timeout_configured is not None), None)
+        return self[node_with_value].config.stale_timeout_configured if node_with_value is not None else None
+
+    def get_stale_timeout_multiplier(self, nid: str) -> float:
+        return self[next(self.rsearch(nid, lambda n: n.config.stale_timeout_multiplier is not None)
+                         )].config.stale_timeout_multiplier
+
     def is_published_single_depth(self, nid: str) -> bool:
         return self[next(self.rsearch(nid, lambda n: n.publish_single_depth is not None))].publish_single_depth
     
@@ -456,7 +452,17 @@ class EquipmentTree(TopicTree):
         return not any(p.last_updated is None for p in self.points(nid) if self.is_active(p.identifier))
 
     def is_stale(self, nid: str) -> bool:
-        return any(p.stale for p in self.points(nid) if self.is_active(p.identifier))
+        stale_timeout_configured = self.get_stale_timeout_configured(nid)
+        stale_timeout_multiplier = self.get_stale_timeout_multiplier(nid)
+        polling_interval = self.get_polling_interval(nid)
+
+        if stale_timeout_configured is None and (polling_interval is None or stale_timeout_multiplier is None):
+                stale_timeout = float('inf')
+        else:
+            stale_timeout = timedelta(seconds=(stale_timeout_configured
+                                               if stale_timeout_configured is not None
+                                               else polling_interval * stale_timeout_multiplier))
+        return True if get_aware_utc_now() - self.get_node(nid).last_updated > stale_timeout else False
 
     def active_points(self, points: EquipmentNode | Iterable[EquipmentNode]) -> Iterable[PointNode]:
         points = self.points(points.identifier) if isinstance(points, EquipmentNode) else points
@@ -468,7 +474,7 @@ class EquipmentTree(TopicTree):
 
     def non_stale_points(self, points: EquipmentNode | Iterable[EquipmentNode]) -> Iterable[PointNode]:
         points = self.points(points.identifier) if isinstance(points, EquipmentNode) else points
-        return {p for p in points if not p.stale}
+        return {p for p in points if not self.is_stale(p.identifier)}
 
     def update_stored_registry_config(self, nid: str):
         # TODO: This updates the registry using JSON no matter what its original saved format was. This should be fine,

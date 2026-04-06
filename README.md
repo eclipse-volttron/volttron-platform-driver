@@ -178,17 +178,19 @@ vctl status
 ```
 
 To communicate with devices, one or more driver interfaces will also need to be installed.
-Each interface is distributed as a library and may be installed separately using poetry.
+Each interface is distributed as a library and may be installed separately using `vctl install-lib`.
 In the current RC version of the driver, only two interfaces are fully supported:
 
 * A Fake Driver (which returns data from a csv file):
     ```shell
-    poetry add --directory $VOLTTRON_HOME volttron-lib-fake-driver
+    vctl install-lib volttron-lib-fake-driver
     ```
 * BACnet:
     ```shell
-    poetry add --directory $VOLTTRON_HOME volttron-lib-fake-driver
+    vctl install-lib volttron-lib-bacnet-driver
     ```
+
+Libraries may be removed later with `vctl remove-lib <library name>`.
 
 Additional interfaces will be available in later RC releases.
 

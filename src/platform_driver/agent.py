@@ -86,8 +86,7 @@ from .scalability_testing import ScalabilityTester
 
 try:
     distribution('volttron-core')
-    from volttron.utils.context import ClientContext as Cc
-    logging.basicConfig(filename=f"{Cc.get_volttron_home()}/driver.log", level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    setup_logging()
 except PackageNotFoundError:
     setup_logging()
 _log = logging.getLogger(__name__)
@@ -285,18 +284,32 @@ class PlatformDriverAgent(Agent):
     def _get_or_create_remote(self, equipment_name: str, remote_config: RemoteConfig, allow_duplicate_remotes: bool,
                               is_update: bool = False):
         interface = self._get_configured_interface(remote_config)
+
+        if isinstance(remote_config, RemoteConfig):
+            interface_config_class = getattr(interface, 'INTERFACE_CONFIG_CLASS', RemoteConfig)
+            default_config = getattr(interface, 'default_config', {})
+            if not isinstance(default_config, dict):
+                default_config = {}
+            config_dump = remote_config.model_dump()
+            if interface_config_class is not RemoteConfig:
+                interface_config = interface_config_class(**(default_config | config_dump))
+            else:
+                interface_config = remote_config
+        else:
+            interface_config = remote_config
+
         allow_duplicate_remotes = True if (allow_duplicate_remotes or self.config.allow_duplicate_remotes) else False
         if not allow_duplicate_remotes:
-            unique_remote_id = interface.unique_remote_id(equipment_name, remote_config)
+            unique_remote_id = interface.unique_remote_id(equipment_name, interface_config)
         else:
-            unique_remote_id = BaseInterface.unique_remote_id(equipment_name, remote_config)
+            unique_remote_id = BaseInterface.unique_remote_id(equipment_name, interface_config)
 
         remote = self.equipment_tree.remotes.get(unique_remote_id)
         if not remote:
-            remote = DriverAgent(remote_config, self.core, self.equipment_tree, self.scalability_test,
+            remote = DriverAgent(interface_config, self.core, self.equipment_tree, self.scalability_test,
                                        self.config.timezone, unique_remote_id, self.vip)
             self.equipment_tree.remotes[unique_remote_id] = remote
-        elif not is_update and remote.config != remote.interface.INTERFACE_CONFIG_CLASS(**remote_config.model_dump()):
+        elif not is_update and remote.config != remote.interface.INTERFACE_CONFIG_CLASS(**interface_config.model_dump()):
             # TODO: Can we support some settings being different between two groupings on same remote?
             #       e.g., two groups with different cov_lifetime intervals?
             #       (This doesn't affect remote itself, but is an interface specific configuration.)

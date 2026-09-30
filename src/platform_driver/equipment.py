@@ -27,7 +27,6 @@ import logging
 
 from datetime import datetime, timedelta
 from importlib.metadata import distribution, PackageNotFoundError
-from treelib.exceptions import DuplicatedNodeIdError
 from typing import Any, cast, Iterable, Optional, TYPE_CHECKING, Union
 from weakref import WeakValueDictionary
 
@@ -45,7 +44,7 @@ except PackageNotFoundError:
 
 from .overrides import OverrideError
 from .reservations import ReservationLockError
-from .topic_tree import TopicNode, TopicTree
+from volttron.lib.tree import DuplicatedNodeIdError, TopicNode, TopicTree
 
 
 _log = logging.getLogger(__name__)
@@ -159,7 +158,9 @@ class DeviceNode(EquipmentNode):
 
     @property
     def all_publish_interval(self) -> float:
-        return self.data['config'].all_publish_interval
+        return (self.data['config'].all_publish_interval
+                if self.data['config'] is not None
+                else self._remote.equipment_model.agent.config.all_publish_interval)
 
     @property
     def remote(self) -> DriverAgent:
@@ -260,13 +261,24 @@ class EquipmentTree(TopicTree):
         parent = self.add_segment('/'.join(ancestral_topic))
 
         # Set up the device node itself.
-        try:
-            # TODO: It would be possible to allow inheritance of dev_config properties from something set on parent,
-            #  similar to how registry configs are handled.
+        # TODO: It would be possible to allow inheritance of dev_config properties from something set on parent,
+        #  similar to how registry configs are handled.
+        existing = self.get_node(device_topic)
+        if existing is None or not existing.is_concrete:
             device_node = DeviceNode(config=dev_config, driver=remote, tag=device_name, identifier=device_topic)
             device_node.data['registry_name'] = self.set_registry_name(device_node.identifier)
-            self.add_node(device_node, parent=parent)
-        except DuplicatedNodeIdError:
+            if existing is None:
+                self.add_node(device_node, parent=parent)
+            else:
+                # The topic already exists as a bare segment, created as an ancestor of equipment configured earlier
+                # (e.g. a device at devices/a/b/METER before the device at devices/a/b). Replace it with the device
+                # node, keeping its subtree attached so that the earlier equipment is unaffected.
+                children = [child.identifier for child in self.children(device_topic)]
+                self.link_past_node(device_topic)
+                self.add_node(device_node, parent=parent)
+                for child in children:
+                    self.move_node(child, device_topic)
+        else:
             # TODO: If the node already exists, update it as necessary?
             device_node = self.get_node(device_topic)
 
@@ -293,7 +305,7 @@ class EquipmentTree(TopicTree):
             if remote is not None and dev_node.remote != remote:
                 dev_node.data['remote'] = remote
                 changes = True
-        existing_points = {p.identifier for p in self.points(nid)}
+        existing_points = {p.identifier for p in self.device_points(nid)}
         while registry_config:
             point_config = registry_config.pop()
             point_id = '/'.join([nid, point_config.volttron_point_name])
@@ -334,8 +346,7 @@ class EquipmentTree(TopicTree):
                 node = EquipmentNode(tag=segment, identifier=nid, config=EquipmentConfig())
                 self.add_node(node, parent)  # TODO: This does raise the DuplicatedNodeIdError, not just replace, right?
             except DuplicatedNodeIdError:
-                # TODO: How to handle updates if this node is the intended target?
-                pass  # We are not creating nor updating this node, which already exists.
+                node = self.get_node(nid)   # Already exists; if it is the target, its config is updated below.
             parent = nid
         if node and config:
             node.config = config
@@ -374,6 +385,15 @@ class EquipmentTree(TopicTree):
         else:
             points = [self[n] for n in self.expand_tree(nid) if self[n].is_point]
         return points
+
+    def device_points(self, nid: str) -> list[PointNode]:
+        """The points which belong to the device nid itself.
+
+        points(nid) returns every point in the subtree below nid, which for a device also includes the points of any
+        other device whose topic is nested beneath it (e.g. devices/a/b/METER under devices/a/b). Use this wherever a
+        device's own registry is meant: configuring its remote, polling, and storing its registry.
+        """
+        return [p for p in self.points(nid) if self.get_device_node(p.identifier).identifier == nid]
 
     def devices(self, nid: str = None) -> Iterable[DeviceNode]:
         if nid is None:
@@ -480,6 +500,6 @@ class EquipmentTree(TopicTree):
         # TODO: This updates the registry using JSON no matter what its original saved format was. This should be fine,
         #  and JSON should probably be preferred anyway, but it does not update the name, which is probably foo.csv....
         device_node = self.get_device_node(nid)
-        registry = [p.config.model_dump() for p in self.points(device_node.identifier)]
+        registry = [p.config.model_dump() for p in self.device_points(device_node.identifier)]
         if device_node.registry_name:
             self.agent.vip.config.set(device_node.registry_name, registry)

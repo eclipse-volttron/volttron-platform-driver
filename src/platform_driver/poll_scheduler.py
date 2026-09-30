@@ -173,7 +173,9 @@ class PollScheduler(metaclass=abc.ABCMeta):
 
     @classmethod
     def _build_poll_sets(cls, data_model: EquipmentTree):
+        _log.debug(f'@@@@@@ IN BUILD POLL SETS @@@@@')
         for remote in data_model.remotes.values():
+            _log.debug(f'@@@@@@ REMOTE: {remote.unique_id}')
             poll_sets = defaultdict(dict)
             groups = set()
             for point in remote.point_set:
@@ -184,11 +186,13 @@ class PollScheduler(metaclass=abc.ABCMeta):
                         poll_sets[group][interval] = PollSet(data_model, remote)
                     poll_sets[group][interval].add(point)
                     groups.add(group)
+            _log.debug(f'@@@@@@ POLL_SETS BEFORE GROUP LOOP IS: {poll_sets}')
             for group in poll_sets:
                 if remote not in cls.poll_sets[group]:
                     cls.poll_sets[group][remote] = defaultdict(lambda: PollSet(data_model, remote))
                 for interval in poll_sets[group]:
                     cls.poll_sets[group][remote][interval] = poll_sets[group][interval]
+        _log.debug("@@@@@@ CLS.POLL_SETS AFTER ALL LOOPS IS: {}".format({k0: {k1.unique_id: [k2 for k2 in v1.keys()] for k1, v1 in v0.items()} for k0, v0 in cls.poll_sets.items()}))
 
     @staticmethod
     def find_starting_datetime(now: datetime, interval: timedelta, group_delay: timedelta = None):
@@ -200,6 +204,18 @@ class PollScheduler(metaclass=abc.ABCMeta):
             return now + interval + group_delay
         next_from_midnight = seconds_from_midnight - offset + interval
         return midnight + next_from_midnight + group_delay
+    #
+    # @staticmethod
+    # def find_starting_datetime(now: datetime, interval: timedelta, group_delay: timedelta = None):
+    #     group_delay = timedelta(seconds=0.0) if not isinstance(group_delay, timedelta) else group_delay
+    #     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    #     seconds_from_midnight = (now - midnight)
+    #     offset = seconds_from_midnight % interval
+    #     if True:
+    #         return now + group_delay
+    #         return now + interval + group_delay
+    #     next_from_midnight = seconds_from_midnight - offset + interval
+    #     return midnight + next_from_midnight + group_delay
 
     @classmethod
     def add_to_schedule(cls, point: PointNode, data_model: EquipmentTree):

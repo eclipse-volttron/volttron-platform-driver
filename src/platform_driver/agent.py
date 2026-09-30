@@ -84,13 +84,9 @@ from .poll_scheduler import PollScheduler
 from .reservations import ReservationManager
 from .scalability_testing import ScalabilityTester
 
-try:
-    distribution('volttron-core')
-    from volttron.utils.context import ClientContext as Cc
-    logging.basicConfig(filename=f"{Cc.get_volttron_home()}/driver.log", level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name)s %(message)s')
-except PackageNotFoundError:
-    setup_logging()
+setup_logging()
 _log = logging.getLogger(__name__)
+
 __version__ = '4.0'
 
 
@@ -156,24 +152,24 @@ class PlatformDriverAgent(Agent):
         else:
             # Some settings cannot be changed while running. Warn and replace these with the old ones until restart.
             _log.info('Updated configuration received for Platform Driver.')
-            if new_config.max_open_sockets != old_config['max_open_sockets']:
-                new_config.max_open_sockets = old_config['max_open_sockets']
+            if new_config.max_open_sockets != old_config.max_open_sockets:
+                new_config.max_open_sockets = old_config.max_open_sockets
                 _log.info('Restart Platform Driver for changes to the max_open_sockets setting to take effect')
 
-            if new_config.max_concurrent_publishes != old_config['max_concurrent_publishes']:
-                new_config.max_concurrent_publishes = old_config['max_concurrent_publishes']
+            if new_config.max_concurrent_publishes != old_config.max_concurrent_publishes:
+                new_config.max_concurrent_publishes = old_config.max_concurrent_publishes
                 _log.info('Restart Platform Driver for changes to the max_concurrent_publishes setting to take effect')
 
-            if new_config.scalability_test != old_config['scalability_test']:
-                new_config.scalability_test = old_config['scalability_test']
+            if new_config.scalability_test != old_config.scalability_test:
+                new_config.scalability_test = old_config.scalability_test
                 if not old_config.scalability_test:
                     _log.info('Restart Platform Driver with scalability_test set to true in order to run a test.')
                 if old_config.scalability_test:
                     _log.info("A scalability test may not be interrupted. Restart the driver to stop the test.")
             try:
-                if new_config.scalability_test_iterations != old_config['scalability_test_iterations'] and \
+                if new_config.scalability_test_iterations != old_config.scalability_test_iterations and \
                         old_config.scalability_test:
-                    new_config.scalability_test_iterations = old_config['scalability_test_iterations']
+                    new_config.scalability_test_iterations = old_config.scalability_test_iterations
                     _log.info('The scalability_test_iterations setting cannot be changed without restarting the agent.')
             except ValueError:
                 pass
@@ -256,7 +252,9 @@ class PlatformDriverAgent(Agent):
 
     def _configure_new_equipment(self, equipment_name: str, _, contents: dict, schedule_now: bool = True) -> bool:
         existing_node = self.equipment_tree.get_node(equipment_name)
-        if existing_node:
+        # A bare topic segment (an ancestor of equipment configured earlier) is not existing equipment: fall through
+        # and configure the device or segment at this topic. EquipmentTree.add_device replaces the bare node.
+        if existing_node is not None and existing_node.is_concrete:
             if not existing_node.config_finished:
                 existing_node.config_finished = True
                 return False
@@ -267,6 +265,7 @@ class PlatformDriverAgent(Agent):
             if dev_config:
                 # Received new device node.
                 remote = self._get_or_create_remote(equipment_name, remote_config, dev_config.allow_duplicate_remotes)
+                registry_configs = remote.interface.prepare_registry_config(registry_configs, remote_config)
                 validated_reg_configs = (remote.interface.REGISTER_CONFIG_CLASS(**r) for r in registry_configs)
                 device_node = self.equipment_tree.add_device(device_topic=equipment_name, dev_config=dev_config,
                                                              remote=remote, registry_configs=validated_reg_configs)
@@ -275,7 +274,8 @@ class PlatformDriverAgent(Agent):
                 equipment_config = EquipmentConfig(**contents)
                 self.equipment_tree.add_segment(equipment_name, equipment_config)
             if schedule_now:
-                points = self.equipment_tree.points(equipment_name)
+                points = (self.equipment_tree.device_points(equipment_name) if dev_config
+                          else self.equipment_tree.points(equipment_name))
                 self._update_polling_schedules(points)
             return True
         except ValueError as e:
@@ -340,10 +340,13 @@ class PlatformDriverAgent(Agent):
                 pass
         else:
             remote = None
+        if remote is not None:
+            registry_configs = remote.interface.prepare_registry_config(registry_configs, remote_config)
         validated_reg_configs = [remote.interface.REGISTER_CONFIG_CLASS(**r) for r in registry_configs]
         is_changed = self.equipment_tree.update_equipment(config_name, dev_config, remote, validated_reg_configs)
         if is_changed:
-            points = self.equipment_tree.points(config_name)
+            points = (self.equipment_tree.device_points(config_name) if dev_config
+                      else self.equipment_tree.points(config_name))
             self._update_polling_schedules(points)
         return is_changed
 

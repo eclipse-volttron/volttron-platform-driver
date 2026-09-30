@@ -39,7 +39,7 @@ classifiers = [
 python = ">=3.10,<4.0"
 argcomplete = ">=3.6.2"
 treelib = ">=1.7.0"
-volttron-lib-base-driver = ">=2.0.0rc3"
+volttron-lib-base-driver = ">=2.0.0rc6"
 # volttron-lib-topic-tree = { path = "../volttron-lib-topic-tree", develop = true }
 
 

@@ -51,6 +51,7 @@ class GroupConfig(BaseModel):
 
 class PlatformDriverConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True, populate_by_name=True)
+    all_publish_interval: float = 0.0
     allow_duplicate_remotes: bool = False
     allow_no_lock_write: bool = True  # Deprecated.
     # TODO: Is there a better default for breadth_first_base besides "devices" or "points",
@@ -73,7 +74,7 @@ class PlatformDriverConfig(BaseModel):
     publish_all_breadth: bool = Field(default=False, alias='publish_breadth_first_all')
     publish_multi_depth: bool = Field(default=True, alias='publish_depth_first_multi')
     publish_multi_breadth: bool = Field(default=False, alias='publish_breadth_first_multi')
-    remote_heartbeat_interval: float = 60.0
+    remote_heartbeat_interval: float = Field(default=60.0, alias='driver_heartbeat_interval')
     reservation_preempt_grace_time: float = 60.0
     reservation_publish_interval: float = 60.0
     reservation_required_for_write_configured: bool = Field(default=False, alias='reservation_required_for_write')

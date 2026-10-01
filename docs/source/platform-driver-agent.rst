@@ -276,6 +276,11 @@ To store the driver configuration run the command:
 
     volttron-ctl config store platform.driver devices/my_campus/my_building/my_device modbus_config.config
 
+Additional Configuration for production environments
+----------------------------------------------------
+
+Since platform driver is designed to read and write information from various devices, once you test your agents in development environment, we highly recommend you **add authorization rules to your production deployment** to prevent unauthorized access to your devices. Please refer to `VIP Authorization <https://eclipse-volttron.readthedocs.io/en/latest/platform-features/message-bus/vip/vip-authorization.html>`_  on how to configure authorization rules to protect driver rpc calls and devices topic that driver writes to.
+
 
 Usage
 =====

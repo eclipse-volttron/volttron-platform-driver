@@ -23,6 +23,11 @@ This documentation is current up to version 1.x of the Platform Driver Agent and
 to reflect new features and behaviors in the course of RC releases. Most existing configurations
 and behaviors remain valid, however, so this remains a good source of information.
 
+# Deployment considerations
+Since platform driver is designed to read and write information from various devices, once you test your agents in development environment, we highly recommend you **add authorization rules to your production deployment** to prevent unauthorized access to your devices. Please refer to [VIP Authorization](https://eclipse-volttron.readthedocs.io/en/latest/platform-features/message-bus/vip/vip-authorization.html) on how to configure authorization rules to protect driver rpc calls and devices topic that driver writes to.
+
+# New features in version 2.0
+
 #### New Polling Features
 The Platform Driver version 2.0 does introduce multiple new capabilities.
 A detailed table showing current state of completion of features to be included in

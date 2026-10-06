@@ -253,6 +253,29 @@ compatability and will work the same as the name in the key of this dictionary.
 }
 ```
 
+## Securing device writes
+
+By default, every agent that is authenticated to the message bus can call the Platform Driver's write methods
+(`set_point`, `set_multiple_points`, `revert_point`, `revert_device`, `set_override_on` and `set_override_off`),
+whatever capabilities it has otherwise been granted. This default is kept for compatibility with existing
+deployments, but it means that any compromised or misbehaving agent on the platform can actuate every device the
+driver controls. **Operators are strongly recommended to protect these methods** by requiring authorization for them
+and granting it only to the agents that are meant to write to devices:
+
+```bash
+# Require authorization for the write methods of the Platform Driver.
+vctl authz add agent platform.driver --protected-rpcs set_point set_multiple_points revert_point revert_device set_override_on set_override_off
+
+# Create a role carrying the write capabilities and assign it to the agents that need them.
+vctl authz add role device_writer --rpc-capabilities platform.driver.set_point platform.driver.set_multiple_points platform.driver.revert_point platform.driver.revert_device
+vctl authz add agent my.control.agent --role-names device_writer
+```
+
+Replace `platform.driver` with the driver's VIP identity if it has been changed, and list only the methods each
+role actually needs. Calls to a protected method from an agent without the matching capability are refused by the
+platform's authorization service. Reads (`get_point`, `get_multiple_points`, `scrape_all`) may be protected in the
+same way where device data is sensitive.
+
 # Development
 
 Please see the following for contributing guidelines [contributing](https://github.com/eclipse-volttron/volttron-core/blob/develop/CONTRIBUTING.md).

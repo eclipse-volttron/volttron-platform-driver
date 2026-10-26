@@ -461,9 +461,9 @@ class ReservationManager(object):
             start = parse_timestamp_string(start)
             end = parse_timestamp_string(end)
             if start.tzinfo is None:
-                start = local_tz.localize(start)
+                start = start.replace(tzinfo=local_tz)
             if end.tzinfo is None:
-                end = local_tz.localize(end)
+                end = end.replace(tzinfo=local_tz)
             requests.append([device, start, end])
         _log.debug(f"Got new reservation request: {sender}, {task_id}, {priority}, {requests}")
         

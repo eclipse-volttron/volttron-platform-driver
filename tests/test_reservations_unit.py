@@ -1389,3 +1389,32 @@ class TestReservationManagerCleanup:
 
 if __name__ == '__main__':
     pytest.main()
+
+
+class TestReservationManagerNaiveTimes:
+    """Naive request times are read in the system's local zone. tzlocal 5 returns zoneinfo zones, which have no
+    localize(); the conversion must work with those as well as with the pytz-style zones of tzlocal 4."""
+
+    @pytest.fixture
+    def reservation_manager(self):
+        parent = Mock()
+        parent.vip = Mock()
+        parent.vip.config.get = MagicMock(return_value=pickle.dumps({}))
+        parent.vip.config.set = MagicMock()
+        parent.config = Mock()
+        parent.config.reservation_publish_interval = 60
+        rm = ReservationManager(parent, 10)
+        rm._cleanup = MagicMock()
+        rm.save_state = MagicMock()
+        return rm
+
+    def test_naive_times_are_read_in_the_local_zoneinfo_zone(self, reservation_manager):
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo("America/Los_Angeles")
+        with patch("platform_driver.reservations.get_localzone", return_value=zone):
+            result = reservation_manager.new_task("test.agent", "naive", "HIGH",
+                                                  [['device1', '2022-07-01T12:00:00', '2022-07-01T13:00:00']])
+        assert result.success, result.info_string
+        task = reservation_manager.tasks["naive"]
+        assert task.time_slice.start == datetime(2022, 7, 1, 12, tzinfo=zone)
+        assert task.time_slice.start.utcoffset() == timedelta(hours=-7)

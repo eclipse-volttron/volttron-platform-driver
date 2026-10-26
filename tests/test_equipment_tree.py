@@ -95,5 +95,5 @@ def test_segment_config_applies_to_an_existing_segment(tree):
     from volttron.driver.base.config import EquipmentConfig
     tree.add_device(METER, DeviceConfig(), mock.Mock(), _points('Watts'))
     tree.add_segment('devices/PNNL/SEB', EquipmentConfig(group='plant'))
-    assert tree.get_node('devices/PNNL/SEB').group == 'plant'
+    assert tree.get_node('devices/PNNL/SEB').polling_group == 'plant'
     assert tree.get_group(f'{METER}/Watts') == 'plant'

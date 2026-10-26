@@ -81,6 +81,7 @@ from .constants import *
 from .equipment import DeviceNode, EquipmentNode, EquipmentTree, PointNode
 from .overrides import OverrideManager
 from .poll_scheduler import PollScheduler
+from .served_state import ServedStateStore
 from .reservations import ReservationManager
 from .scalability_testing import ScalabilityTester
 
@@ -107,6 +108,7 @@ class PlatformDriverAgent(Agent):
         self.publishers = {}
         self.reservation_manager = None  # TODO: Should this use a default reservation manager?
         self.scalability_test = None
+        self.served_state = ServedStateStore(self, self.config.served_state_flush_interval)
         self._stop_agent = Event()
 
         self.vip.config.set_default("config", self.config.model_dump())
@@ -123,6 +125,7 @@ class PlatformDriverAgent(Agent):
     def _on_stop(self, _, **__):
         # TODO: Integrate this with greenlets other than heartbeat.
         self._stop_agent.set()
+        self.served_state.flush()
 
     def _load_agent_config(self, config: dict) -> PlatformDriverConfig:
         try:
@@ -179,6 +182,7 @@ class PlatformDriverAgent(Agent):
             self.config = new_config
         if self.override_manager is None:
             self.override_manager = OverrideManager(self)
+        self.served_state.flush_interval = self.config.served_state_flush_interval
 
         # Set up Reservation Manager:
         if self.reservation_manager is None:
@@ -217,8 +221,9 @@ class PlatformDriverAgent(Agent):
 
         # Schedule Polling
         self.poll_schedulers = PollScheduler.setup(self.equipment_tree, self.config.groups)
-        for poll_scheduler in self.poll_schedulers.values():
-            poll_scheduler.schedule()
+        for group, poll_scheduler in self.poll_schedulers.items():
+            self._schedule_group(group, poll_scheduler)
+        self._poll_once(self.equipment_tree.points())
 
         # Set up All Publishes:
         self._start_all_publishes()
@@ -269,6 +274,8 @@ class PlatformDriverAgent(Agent):
                 validated_reg_configs = (remote.interface.REGISTER_CONFIG_CLASS(**r) for r in registry_configs)
                 device_node = self.equipment_tree.add_device(device_topic=equipment_name, dev_config=dev_config,
                                                              remote=remote, registry_configs=validated_reg_configs)
+                # Served values saved by an earlier run go into the tree first, so the registration carries them.
+                self.served_state.load_into(device_node)
                 remote.add_equipment(device_node)
             else: # Received new or updated segment node.
                 equipment_config = EquipmentConfig(**contents)
@@ -350,7 +357,15 @@ class PlatformDriverAgent(Agent):
             self._update_polling_schedules(points)
         return is_changed
 
+    def _poll_once(self, points):
+        """Read the ``POLL_ONCE`` points among ``points`` now, each remote's in one request, off the caller's greenlet."""
+        for poll_set in PollScheduler.one_shot_poll_sets(self.equipment_tree, points):
+            _log.info(f'Polling {len(poll_set.points)} poll-once point(s) on {poll_set.remote.unique_id}.')
+            self.core.spawn(poll_set.remote.poll_data, poll_set)
+
     def _update_polling_schedules(self, points):
+        points = list(points)
+        self._poll_once(points)
         reschedules_required, new_groups = [], []
         for point in points:
             group = self.equipment_tree.get_group(point.identifier)
@@ -362,7 +377,17 @@ class PlatformDriverAgent(Agent):
             self.poll_schedulers.update(PollScheduler.create_poll_schedulers(self.equipment_tree, self.config.groups,
                                                                              new_groups, len(self.poll_schedulers)))
         for updated_group in reschedules_required:
-            self.poll_schedulers[updated_group].schedule()
+            self._schedule_group(updated_group, self.poll_schedulers[updated_group])
+
+    @staticmethod
+    def _schedule_group(group: str, poll_scheduler) -> bool:
+        """Schedule one polling group's polls; a failure is logged and leaves the other groups' scheduling to proceed."""
+        try:
+            poll_scheduler.schedule()
+            return True
+        except Exception as e:
+            _log.error(f'Polling group {group!r} could not be scheduled; its points will not be polled: {e!r}', exc_info=True)
+            return False
 
     def _remove_equipment(self, config_name: str, _, __, leave_disconnected=False) -> bool:
         """Callback to remove equipment configuration."""
@@ -370,6 +395,9 @@ class PlatformDriverAgent(Agent):
         for point in self.equipment_tree.points(config_name):
             group = self.equipment_tree.get_group(point.identifier)
             poll_schedulers.append(self.poll_schedulers.get(group))
+        node = self.equipment_tree.get_node(config_name)
+        if node is not None and getattr(node, 'is_device', False):
+            self.served_state.forget(config_name)
         removed_count = self.equipment_tree.remove_segment(config_name, leave_disconnected)
         # TODO: Add reschedule_all_on_update option and reschedule all poll_schedulers when true.
         return True if removed_count > 0 else False
@@ -440,45 +468,54 @@ class PlatformDriverAgent(Agent):
     ###############
 
     @RPC.export
-    def get(self, topic: str | Sequence[str] | Set[str] = None, regex: str = None) -> tuple[dict, dict]:
+    def get(self, topic: str | Sequence[str] | Set[str] = None, regex: str = None, **kwargs) -> tuple[dict, dict]:
+        """Read the selected points. Keyword arguments not named here are interface-specific read options (e.g.
+        BACnet's on_property) and are passed through to the interface unchanged."""
         # Find set of points to query and organize by remote:
         query_plan = self.build_query_plan(topic, regex)
-        return self._get(query_plan)
+        return self._get(query_plan, **kwargs)
 
     @RPC.export
-    def semantic_get(self, query: str) -> tuple[dict, dict]:
+    def semantic_get(self, query: str, **kwargs) -> tuple[dict, dict]:
         exact_matches = self.semantic_query(query)
         query_plan = self.build_query_plan(exact_matches)
-        return self._get(query_plan)
+        return self._get(query_plan, **kwargs)
 
-    def _get(self, query_plan: dict[DriverAgent, Set[PointNode]]):
-        """Make query for selected points on each remote"""
+    def _get(self, query_plan: dict[DriverAgent, Set[PointNode]], **kwargs):
+        """Make query for selected points on each remote. ``kwargs`` are interface-specific read options."""
         results, errors = {}, {}
         for (remote, point_set) in query_plan.items():
-            q_return_values, q_return_errors = remote.get_multiple_points([p.identifier for p in point_set])
-            for topic, val in q_return_values.items():
-                node = self.equipment_tree.get_node(topic)
-                if node:
-                    node.last_value = val
+            q_return_values, q_return_errors = remote.get_multiple_points([p.identifier for p in point_set], **kwargs)
+            if not kwargs:
+                # Read options select something other than the point's ordinary value (e.g. another BACnet
+                # property), so only an unqualified read may refresh the cached last values.
+                for topic, val in q_return_values.items():
+                    node = self.equipment_tree.get_node(topic)
+                    if node:
+                        node.last_value = val
             results.update(q_return_values)
             errors.update(q_return_errors)
         return results, errors
 
     @RPC.export
     def set(self, value: Any, topic: str | Sequence[str] | Set[str] = None, regex: str = None,
-            confirm_values: bool = False, map_points: bool = False) -> tuple[dict, dict]:
+            confirm_values: bool = False, map_points: bool = False, **kwargs) -> tuple[dict, dict]:
+        """Write the selected points. Keyword arguments not named here are interface-specific write options (e.g.
+        BACnet's priority) and are passed through to the interface unchanged."""
         query_plan = self.build_query_plan(topic, regex)
-        return self._set(value, query_plan, confirm_values, map_points)
+        return self._set(value, query_plan, confirm_values, map_points, **kwargs)
 
     @RPC.export
-    def semantic_set(self, value: Any, query: str, confirm_values: bool = False) -> tuple[dict, dict]:
+    def semantic_set(self, value: Any, query: str, confirm_values: bool = False, **kwargs) -> tuple[dict, dict]:
         exact_matches = self.semantic_query(query)
         query_plan = self.build_query_plan(exact_matches)
-        return self._set(value, query_plan, confirm_values)
+        return self._set(value, query_plan, confirm_values, **kwargs)
 
-    def _set(self, value: Any, query_plan: dict[DriverAgent, Set[PointNode]], confirm_values: bool, map_points=False
-             ) -> tuple[dict, dict]:
-        """Set selected points on each remote"""
+    def _set(self, value: Any, query_plan: dict[DriverAgent, Set[PointNode]], confirm_values: bool, map_points=False,
+             **kwargs) -> tuple[dict, dict]:
+        """Set selected points on each remote. ``kwargs`` are interface-specific write options. The confirming read
+        receives the same options so that it reads what was written (e.g. the same BACnet property); the interface
+        ignores any that do not apply to a read."""
         results, errors = {}, {}
         sender = self.vip.rpc.context.vip_message.peer
         for (remote, point_set) in query_plan.items():
@@ -487,32 +524,43 @@ class PlatformDriverAgent(Agent):
                     self.equipment_tree.raise_on_locks(point, sender)
                 except:
                     pass # TODO: Handle this exception.
-            # TODO: When map_points is True, all topics are sent to all remotes. This is probably wrong.
-            point_value_tuples = list(value.items()) if map_points else [(p.identifier, value) for p in point_set]
-            query_return_results, query_return_errors = remote.set_multiple_points(point_value_tuples)
+            # map_points: value maps each point's topic to its own value; a remote gets only its points' items.
+            point_value_tuples = ([(p.identifier, value[p.identifier]) for p in point_set if p.identifier in value] if map_points
+                                  else [(p.identifier, value) for p in point_set])
+            if not point_value_tuples:
+                continue
+            query_return_results, query_return_errors = remote.set_multiple_points(point_value_tuples, **kwargs)
             results.update(query_return_results)
             errors.update(query_return_errors)
             if confirm_values:
                 # TODO: Should results contain the values read back from the device, or Booleans for success?
-                results.update(remote.get_multiple_points([p.identifier for p in point_set])[0])
+                results.update(remote.get_multiple_points([p.identifier for p in point_set], **kwargs)[0])
+        if map_points:
+            # Topics that match no configured point are not in the plan and never reach a remote; report them as the
+            # interfaces report unknown points of their own.
+            planned = {p.identifier for point_set in query_plan.values() for p in point_set}
+            for topic in value:
+                if topic not in planned and topic not in errors:
+                    errors[topic] = 'Point not configured on device.'
         return results, errors
 
     @RPC.export
-    def revert(self, topic: str | Sequence[str] | Set[str] = None, regex: str = None) -> dict[str, str]:
-              # confirm_values: bool = False) -> dict:
+    def revert(self, topic: str | Sequence[str] | Set[str] = None, regex: str = None, **kwargs) -> dict[str, str]:
+        """Revert the selected points. Keyword arguments not named here are interface-specific revert options (e.g.
+        BACnet's priority) and are passed through to the interface unchanged."""
         query_plan = self.build_query_plan(topic, regex)
-        return self._revert(query_plan)  # , confirm_values)
+        return self._revert(query_plan, **kwargs)  # , confirm_values)
 
     @RPC.export
-    def semantic_revert(self, query: str) -> dict[str, str]:  #, confirm_values: bool = False) -> dict:
+    def semantic_revert(self, query: str, **kwargs) -> dict[str, str]:  #, confirm_values: bool = False) -> dict:
         exact_matches = self.semantic_query(query)
         query_plan = self.build_query_plan(exact_matches)
-        return self._revert(query_plan)  #, confirm_values)
+        return self._revert(query_plan, **kwargs)  #, confirm_values)
 
     @staticmethod
-    def _revert(query_plan) -> dict[str, str]:  #, confirm_values: bool) -> dict[str, str]:
+    def _revert(query_plan, **kwargs) -> dict[str, str]:  #, confirm_values: bool) -> dict[str, str]:
         """
-        Revert each point from query.
+        Revert each point from query. ``kwargs`` are interface-specific revert options.
           If an exception is raised, return it in the error dict.
         """
         # TODO: If it is possible to check values, we may need to do that at the interface level.
@@ -521,7 +569,7 @@ class PlatformDriverAgent(Agent):
         for (remote, point_set) in query_plan.items():
             for point in point_set:
                 try:
-                    remote.revert_point(point.identifier)
+                    remote.revert_point(point.identifier, **kwargs)
                 except Exception as e:
                     # TODO: revert_point may not raise. Does _set_point, typically?  If we make them raise,
                     #  we can return some errors, at least. It may not be possible to check success in all cases.
@@ -626,8 +674,7 @@ class PlatformDriverAgent(Agent):
                 continue
             else:
                 p.active = False
-                group = self.equipment_tree.get_group(p.identifier)
-                self.poll_schedulers[group].remove_from_schedule(p, self.equipment_tree)
+                PollScheduler.remove_from_schedule(p, self.equipment_tree)
         # TODO: Add reschedule_all_on_update option and reschedule all poll_schedulers when true.
 
     @RPC.export
@@ -890,80 +937,109 @@ class PlatformDriverAgent(Agent):
     #-------------------
     # Legacy RPC Methods
     #-------------------
+    # These methods keep the RPC interfaces of the monolithic Platform Driver and of the monolithic Actuator, which
+    # addressed points differently:
+    #   driver:   (path, point_name, ...)           path is the device topic, point_name the bare point name.
+    #   actuator: (requester_id, topic[, point], ...) topic is the full point topic (or the device topic when point
+    #             is given); requester_id was ignored by the actuator and is ignored here.
+    # Each method accepts both positional shapes and both sets of keyword names. Where the positional count does not
+    # settle which shape was used, the two readings are resolved against the equipment tree (see _legacy_point_id).
+
+    def _legacy_point_id(self, method: str, positionals: tuple, topic: str | None = None, point: str | None = None
+                         ) -> str:
+        """Return the equipment identifier addressed by a legacy point RPC.
+
+        :param method: calling RPC method name, for the deprecation message.
+        :param positionals: the topic-like positional arguments in the order received (excluding values).
+        :param topic: the actuator's ``topic`` keyword, if given. Wins over positionals.
+        :param point: the actuator's ``point`` keyword, if given.
+        """
+        if topic is not None:
+            return self._equipment_id(topic, point)
+        if len(positionals) >= 3:
+            # Only the actuator sends three topic-like positionals: (requester_id, topic, point).
+            self._log_actuator_style(method)
+            return self._equipment_id(positionals[1], positionals[2])
+        if len(positionals) == 2:
+            first, second = positionals
+            if point is not None:
+                # (requester_id, topic, point=...): the driver form has no point keyword.
+                self._log_actuator_style(method)
+                return self._equipment_id(second, point)
+            driver_id = self._equipment_id(first, second)      # (path, point_name)
+            if self.equipment_tree.get_node(driver_id):
+                return driver_id
+            actuator_id = self._equipment_id(second)           # (requester_id, 'device/point')
+            if self.equipment_tree.get_node(actuator_id):
+                self._log_actuator_style(method)
+                return actuator_id
+            return driver_id   # Neither reading names known equipment; report the driver reading as not found.
+        if len(positionals) == 1:
+            # The actuator's combined topic, optionally with the point keyword.
+            return self._equipment_id(positionals[0], point)
+        raise TypeError(f'{method}() requires a topic.')
+
+    @staticmethod
+    def _log_actuator_style(method: str):
+        replacement = {'get_point': 'get', 'set_point': 'set', 'revert_point': 'revert', 'revert_device': 'revert',
+                       'set_multiple_points': 'set', 'get_multiple_points': 'get'}.get(method, 'get/set/revert')
+        _log.info(f'Deprecated actuator-style arguments detected in {method}(). '
+                  f'Please consider converting code to use the {replacement}() method.')
+
+    @staticmethod
+    def _present(*values) -> tuple:
+        """The leading run of non-None positionals (a None means the argument was not passed)."""
+        out = []
+        for v in values:
+            if v is None:
+                break
+            out.append(v)
+        return tuple(out)
+
     @RPC.export
-    def get_point(self, path: str = None, point_name: str = None, **kwargs) -> Any:
+    def get_point(self, path: str = None, point_name: str = None, *args, topic: str = None, point: str = None,
+                  requester_id: str = None, **kwargs) -> Any:
         """
         RPC method
 
         Gets up-to-date value of a specific point on a device.
         Does not require the device be scheduled.
 
-        :param path: The topic of the point to grab in the
-                      format <device topic>/<point name>
-
-                      Only the <device topic> if point is specified.
-        :param point_name: Point on the device. Assumes topic includes point name if omitted.
-        :param kwargs: Any driver specific parameters
-        :type path: str
+        Accepts the monolithic driver's ``(path, point_name)`` and the actuator's ``(topic[, point])`` forms, as
+        positionals or by keyword. ``requester_id`` is accepted and ignored.
         :returns: point value
-        :rtype: any base python type"""
-
-        # Support for old-actuator-style keyword arguments.
-        path = path if path else kwargs.get('topic', None)
-        point_name = point_name if point_name else kwargs.get('point', None)
-        if path is None:
-            # DEPRECATED: Only allows topic to be None to permit use of old-actuator-style keyword argument "topic".
-            raise TypeError('Argument "path" is required.')
-
-        point_name = self._equipment_id(path, point_name)
-        node = self.equipment_tree.get_node(point_name)
+        :rtype: any base python type
+        """
+        equip_id = self._legacy_point_id('get_point', self._present(path, point_name) + args, topic, point)
+        node = self.equipment_tree.get_node(equip_id)
         if not node:
-            raise ValueError(f'No equipment found for topic: {point_name}')
+            raise ValueError(f'No equipment found for topic: {equip_id}')
         remote = self.equipment_tree.get_remote(node.identifier)
         if not remote:
-            raise ValueError(f'No remote found for topic: {point_name}')
-        return remote.get_point(point_name, **kwargs)
+            raise ValueError(f'No remote found for topic: {equip_id}')
+        return remote.get_point(equip_id, **kwargs)
 
     @RPC.export
-    def set_point(self, path: str, point_name: str | None, value: Any, *args, **kwargs) -> Any:
+    def set_point(self, path: str = None, point_name: str = None, value: Any = None, *args, topic: str = None,
+                  point: str = None, requester_id: str = None, **kwargs) -> Any:
         """RPC method
 
         Sets the value of a specific point on a device.
         Requires the device be scheduled by the calling agent.
 
-        :param path: The topic of the point to set in the
-                      format <device topic>/<point name>
-                      Only the <device topic> if point is specified.
-        :param value: Value to set point to.
-        :param point_name: Point on the device.
-        :param kwargs: Any driver specific parameters
-        :type path: str
-        :type value: any basic python type
-        :type point_name: str
+        Accepts the monolithic driver's ``(path, point_name, value)`` and the actuator's
+        ``(requester_id, topic, value[, point])`` forms, as positionals or by keyword. ``requester_id`` is ignored;
+        the VIP identity of the caller is used.
         :returns: value point was actually set to. Usually invalid values
                 cause an error but some drivers (MODBUS) will return a
-                different
-                value with what the value was actually set to.
+                different value with what the value was actually set to.
         :rtype: any base python type
 
         .. warning:: Calling will raise a ReservationLockError if another agent has already scheduled
         this device for the present time."""
-
         sender = self.vip.rpc.context.vip_message.peer
-
-        # Support for old-actuator-style arguments.
-        topic = kwargs.get('topic')
-        if topic:
-            path = topic
-        elif path == sender or len(args) > 0:
-            # Function was likely called with actuator-style positional arguments. Reassign variables to match.
-            _log.info('Deprecated actuator-style positional arguments detected in set_point().'
-                      ' Please consider converting code to use set() method.')
-            path, point_name = (point_name, args[0]) if len(args) >= 1 else point_name, None
-        point_name = point_name if point_name else kwargs.get('point', None)
-
-        point_name = self._equipment_id(path, point_name)
-        return self._set_point(point_name, value, sender, **kwargs)
+        equip_id = self._legacy_point_id('set_point', self._present(path, point_name) + args, topic, point)
+        return self._set_point(equip_id, value, sender, **kwargs)
 
     def _set_point(self, topic, value, sender, **kwargs):
         node: EquipmentNode = self.equipment_tree.get_node(topic)
@@ -980,98 +1056,105 @@ class PlatformDriverAgent(Agent):
         return result
 
     @RPC.export
-    def scrape_all(self, topic: str) -> dict:
+    def scrape_all(self, path: str = None, topic: str = None, **kwargs) -> dict:
         """RPC method
 
-        Get all points from a device.
-
-        :param topic: Device topic
-        :returns: Dictionary of points to values
+        Get all points from a device. The device topic may be passed as ``path`` (driver) or ``topic`` (actuator).
         """
         _log.info('Call to deprecated RPC method "scrape_all". This method has been superseded by the "get" method'
                   ' and will be removed in a future version. Please update to the newer method.')
-        path = self._equipment_id(topic, None)
-        return self.get(topic=path)[0]
+        device = topic if topic is not None else path
+        if device is None:
+            raise TypeError('scrape_all() requires a device topic.')
+        return self.get(topic=self._equipment_id(device, None), **kwargs)[0]
 
     @RPC.export
-    def get_multiple_points(self, path: str | Sequence[str | Sequence] = None, point_names = None,
+    def get_multiple_points(self, path: str | Sequence[str | Sequence] = None, point_names: Sequence[str] = None,
+                            *args, topics: Sequence[str | Sequence] = None, requester_id: str = None,
                             **kwargs) -> tuple[dict, dict]:
         """RPC method
 
         Get multiple points on multiple devices. Makes a single
         RPC call to the platform driver per device.
 
-        :param path: A topic (with or without point names), a list of full topics (with point names),
-         or a list of [device, point] pairs.
-        :param point_names: A Sequence of point names associated with the given path.
-        :param kwargs: Any driver specific parameters
-
-        :returns: Dictionary of points to values and dictionary of points to errors
+        Accepts the monolithic driver's ``(path, point_names)`` form, where path is one device topic and point_names
+        its bare point names, and the actuator's ``(topics)`` form, where topics is a list of full point topics
+        or of ``[device, point]`` pairs. ``requester_id`` is accepted and ignored.
+        :returns: Tuple of dictionaries to results and any errors
+        :rtype: (dict, dict)
 
         .. warning:: This method does not require that all points be returned
                      successfully. Check that the error dictionary is empty.
         """
-
-        # Support for actuator-style keyword arguments.
-        topics = path if path else kwargs.get('topics', None)
         if topics is None:
-            # path is allowed to be None to permit use of old-actuator-style keyword argument "topics".
+            topics = path
+        if topics is None:
             raise TypeError('Argument "path" is required.')
-
         errors = {}
         devices = set()
         if isinstance(topics, str):
             if not point_names:
-                devices.add(topics)
-            else:
-                for point in point_names:
-                    devices.add(self._equipment_id(topics, point))
+                # A device topic alone: read every point beneath it (a pattern query, not an exact match).
+                return self.get(topic=self._equipment_id(topics), **kwargs)
+            for point in point_names:
+                devices.add(self._equipment_id(topics, point))
         elif isinstance(topics, Sequence):
             for topic in topics:
                 if isinstance(topic, str):
                     devices.add(self._equipment_id(topic))
-                elif isinstance(topic, Sequence) and len(topic) == 2:
-                    devices.add(self._equipment_id(*topic))
+                elif isinstance(topic, Sequence) and len(topic) >= 2:
+                    devices.add(self._equipment_id(topic[0], topic[1]))
                 else:
                     e = ValueError("Invalid topic: {}".format(topic))
                     errors[repr(topic)] = repr(e)
-
-        results, query_errors = self.get(devices)
+        else:
+            raise TypeError(f'Invalid topics argument: {topics!r}')
+        results, query_errors = self.get(devices, **kwargs)
         errors.update(query_errors)
         return results, errors
 
     @RPC.export
-    def set_multiple_points(self, path: str, point_names_values: list[tuple[str, Any]], **kwargs) -> dict:
+    def set_multiple_points(self, path: str = None, point_names_values: Sequence[Sequence] = None, *args,
+                            topics_values: Sequence[Sequence] = None, requester_id: str = None, **kwargs) -> dict:
         """RPC method
 
         Set values on multiple set points at once. If global override is condition is set,raise OverrideError exception.
-        :param path: device path
-        :type path: str
-        :param point_names_values: list of points and corresponding values
-        :type point_names_values: list of tuples
-        :param kwargs: additional arguments for the device
-        :type kwargs: arguments pointer
+
+        Accepts the monolithic driver's ``(path, point_names_values)`` form, where path is one device topic and the
+        items are ``(point_name, value)``, and the actuator's ``(requester_id, topics_values)`` form, where the items
+        are ``(topic, value)`` with topic a full point topic or a ``[device, point]`` pair. The driver form is
+        recognised when path names a device in the equipment tree; ``requester_id`` is ignored.
+        :returns: Dictionary of points to any exceptions raised
+        :rtype: dict
         """
         errors = {}
         topic_value_map = {}
-        sender = self.vip.rpc.context.vip_message.peer
-        # Support for old-actuator-style positional arguments so long as sender matches rpc peer.
-        topics_values = kwargs.get('topics_values')
-        if path == sender or topics_values is not None:  # Method was called with old-actuator-style arguments.
-            topics_values = topics_values if topics_values else point_names_values
+        if topics_values is None:
+            if point_names_values is None:
+                raise TypeError("set_multiple_points() missing 1 required positional argument: 'point_names_values'")
+            if path is None:
+                # Bare point names cannot be resolved without their device; actuator callers use topics_values=.
+                raise TypeError("set_multiple_points() missing 1 required positional argument: 'path'")
+            topics_values = point_names_values
+        driver_style = (topics_values is point_names_values and path is not None
+                        and self.equipment_tree.get_node(self._equipment_id(path)) is not None
+                        and not any(isinstance(t, Sequence) and not isinstance(t, str) for t, _ in topics_values))
+        if driver_style:
+            for point, value in topics_values:
+                topic_value_map[self._equipment_id(path, point)] = value
+        else:
+            if path is not None and topics_values is point_names_values:
+                self._log_actuator_style('set_multiple_points')
             for topic, value in topics_values:
                 if isinstance(topic, str):
-                    topic_value_map[self._equipment_id(topic, None)] = value
-                elif isinstance(topic, Sequence) and len(topic) == 1:
-                    topic_value_map[self._equipment_id(*topic)] = value
+                    topic_value_map[self._equipment_id(topic)] = value
+                elif isinstance(topic, Sequence) and len(topic) >= 2:
+                    topic_value_map[self._equipment_id(topic[0], topic[1])] = value
                 else:
                     e = ValueError("Invalid topic: {}".format(topic))
                     errors[str(topic)] = repr(e)
-        else:  # Assume method was called with old-driver-style arguments.
-            for point, value in point_names_values:
-                topic_value_map[self._equipment_id(path, point)] = value
-
-        _, ret_errors = self.set(topic_value_map, map_points=True, **kwargs)
+        # Only the mapped points are planned (an unqualified query would plan every point of every remote).
+        _, ret_errors = self.set(topic_value_map, topic=list(topic_value_map), map_points=True, **kwargs)
         errors.update(ret_errors)
         return errors
 
@@ -1096,7 +1179,8 @@ class PlatformDriverAgent(Agent):
                     gevent.sleep(self.config.remote_heartbeat_interval / len(self.equipment_tree.remotes))
 
     @RPC.export
-    def revert_point(self, path: str, point_name: str, **kwargs):
+    def revert_point(self, path: str = None, point_name: str = None, *args, topic: str = None, point: str = None,
+                     requester_id: str = None, **kwargs):
         """RPC method
 
         Revert the set point to default state/value.
@@ -1104,26 +1188,12 @@ class PlatformDriverAgent(Agent):
         If topic has been reserved by another user
         or if it is not reserved but reservations are required,
          raise ReservationLockError exception.
-        :param path: device path
-        :type path: str
-        :param point_name: set point to revert
-        :type point_name: str
-        :param kwargs: additional arguments for the device
-        :type kwargs: arguments pointer
+
+        Accepts the monolithic driver's ``(path, point_name)`` and the actuator's ``(requester_id, topic[, point])``
+        forms, as positionals or by keyword. ``requester_id`` is ignored; the VIP identity of the caller is used.
         """
         sender = self.vip.rpc.context.vip_message.peer
-
-        # Support for old-actuator-style arguments.
-        topic = kwargs.get('topic')
-        if topic:
-            path, point_name = topic, None
-        elif path == sender:
-            # Function was likely called with actuator-style positional arguments. Reassign variables to match.
-            _log.info('Deprecated actuator-style positional arguments detected in revert_point().'
-                      ' Please consider converting code to use revert() method.')
-            path, point_name = point_name, None
-
-        equip_id = self._equipment_id(path, point_name)
+        equip_id = self._legacy_point_id('revert_point', self._present(path, point_name) + args, topic, point)
         node = self.equipment_tree.get_node(equip_id)
         if not node:
             raise ValueError(f'No equipment found for topic: {equip_id}')
@@ -1135,32 +1205,30 @@ class PlatformDriverAgent(Agent):
         self._push_result_topic_pair(REVERT_POINT_RESPONSE_PREFIX, equip_id, headers, None)
 
     @RPC.export
-    def revert_device(self, path: str, *args, **kwargs):
+    def revert_device(self, path: str = None, *args, topic: str = None, requester_id: str = None, **kwargs):
         """RPC method
 
         Revert all the set point values of the device to default state/values. If global override is condition is set,
         raise OverrideError exception.
-        :param path: device path
-        :type path: str
-        :param kwargs: additional arguments for the device
-        :type kwargs: arguments pointer
+
+        Accepts the monolithic driver's ``(path)`` and the actuator's ``(requester_id, topic)`` forms, as positionals
+        or by keyword. ``requester_id`` is ignored; the VIP identity of the caller is used.
         """
         sender = self.vip.rpc.context.vip_message.peer
-
-        # Support for old-actuator-style arguments.
-        topic = kwargs.get('topic')
-        if topic:
-            path = topic
-        elif path == sender and len(args) > 0:
-            # Function was likely called with actuator-style positional arguments. Reassign variables to match.
-            _log.info('Deprecated actuator-style positional arguments detected in revert_device().'
-                      ' Please consider converting code to use revert() method.')
-            path = args[0]
-
-        self.revert(self._equipment_id(path, None))
+        if topic is not None:
+            device = topic
+        elif args:
+            # Two positionals can only be the actuator's (requester_id, topic).
+            self._log_actuator_style('revert_device')
+            device = args[0]
+        elif path is not None:
+            device = path
+        else:
+            raise TypeError('revert_device() requires a device topic.')
+        self.revert(self._equipment_id(device, None), **kwargs)
 
         headers = self._get_headers(sender)
-        self._push_result_topic_pair(REVERT_DEVICE_RESPONSE_PREFIX, path, headers, None)
+        self._push_result_topic_pair(REVERT_DEVICE_RESPONSE_PREFIX, device, headers, None)
 
     @RPC.export
     def request_new_schedule(self, _, task_id: str, priority: str,

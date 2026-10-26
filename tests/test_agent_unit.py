@@ -1291,6 +1291,66 @@ class TestPDAUnderscoreGet:
         assert errors == {}
 
 
+class TestScheduleGroup:
+    """One polling group failing to schedule must not stop the others."""
+
+    def test_failure_is_logged_and_contained(self, caplog):
+        scheduler = Mock()
+        scheduler.schedule.side_effect = ValueError('Cannot combine PollSets based on different remotes')
+        with caplog.at_level('ERROR'):
+            assert PlatformDriverAgent._schedule_group('30', scheduler) is False
+        assert 'Polling group \'30\' could not be scheduled' in caplog.text
+
+    def test_success(self):
+        scheduler = Mock()
+        assert PlatformDriverAgent._schedule_group('default', scheduler) is True
+        scheduler.schedule.assert_called_once_with()
+
+
+class TestPDAUnderscoreSetMapping:
+    """Tests for _set with a topic-to-value map: topics matching no configured point are reported, a single value
+    reaches every planned point."""
+
+    @pytest.fixture
+    def PDA(self, base_PDA):
+        base_PDA.equipment_tree = MagicMock()
+        base_PDA.vip = MagicMock()
+        base_PDA.vip.rpc.context.vip_message.peer = 'caller'
+        return base_PDA
+
+    @staticmethod
+    def _plan():
+        remote1, remote2 = MagicMock(spec=DriverAgent), MagicMock(spec=DriverAgent)
+        points = {}
+        for name in ('devices/a/p1', 'devices/a/p2', 'devices/b/p3'):
+            node = MagicMock(spec=PointNode)
+            node.identifier = name
+            points[name] = node
+        plan = {remote1: {points['devices/a/p1'], points['devices/a/p2']}, remote2: {points['devices/b/p3']}}
+        remote1.set_multiple_points.return_value = ({'devices/a/p1': 1, 'devices/a/p2': 2}, {})
+        remote2.set_multiple_points.return_value = ({'devices/b/p3': 3}, {})
+        return remote1, remote2, plan
+
+    def test_map_points_reports_topics_matching_no_point(self, PDA):
+        remote1, remote2, plan = self._plan()
+        value = {'devices/a/p1': 1, 'devices/a/p2': 2, 'devices/b/p3': 3, 'devices/b/nope': 4}
+
+        results, errors = PDA._set(value, plan, confirm_values=False, map_points=True)
+
+        assert errors == {'devices/b/nope': 'Point not configured on device.'}
+        assert results == {'devices/a/p1': 1, 'devices/a/p2': 2, 'devices/b/p3': 3}
+
+    def test_single_value_goes_to_every_planned_point(self, PDA):
+        remote1, remote2, plan = self._plan()
+
+        PDA._set(7, plan, confirm_values=False, map_points=False)
+
+        (sent1,), _ = remote1.set_multiple_points.call_args
+        (sent2,), _ = remote2.set_multiple_points.call_args
+        assert sorted(sent1) == [('devices/a/p1', 7), ('devices/a/p2', 7)]
+        assert sent2 == [('devices/b/p3', 7)]
+
+
 class TestPDASet:
 
     @pytest.fixture
@@ -1558,6 +1618,27 @@ class TestPDAUnderscoreSet:
             expected_tuples), "set_multiple_points called with incorrect arguments."
         assert not errors, "Errors should be empty when no errors are returned."
         assert not results, "Results should be empty when confirm_values is False."
+
+    def test_set_mapped_values_reach_only_the_owning_remote(self):
+        """With map_points, value maps each point's topic to its own value; a remote gets only its points' items and a
+        remote owning none of the mapped points is not called (set_multiple_points used to send every topic to every
+        remote, which refused the foreign ones as not configured)."""
+        remote_a, remote_b, remote_c = Mock(), Mock(), Mock()
+        for remote in (remote_a, remote_b, remote_c):
+            remote.set_multiple_points.return_value = ({}, {})
+        a1, a2, b1, c1 = Mock(), Mock(), Mock(), Mock()
+        a1.identifier, a2.identifier, b1.identifier, c1.identifier = "devices/a/p1", "devices/a/p2", "devices/b/p1", "devices/c/p1"
+        value = {"devices/a/p1": 1, "devices/a/p2": 2, "devices/b/p1": 3}
+        query_plan = {remote_a: {a1, a2}, remote_b: {b1}, remote_c: {c1}}
+
+        agent = Mock()
+        agent.vip.rpc.context.vip_message.peer = "tester"
+        results, errors = PlatformDriverAgent._set(agent, value, query_plan, False, True)
+
+        assert set(remote_a.set_multiple_points.call_args.args[0]) == {("devices/a/p1", 1), ("devices/a/p2", 2)}
+        assert remote_b.set_multiple_points.call_args.args[0] == [("devices/b/p1", 3)]
+        remote_c.set_multiple_points.assert_not_called()
+        assert errors == {} and results == {}
 
     def test_set_single_value_with_confirm(self):
         """Ensure _set sets multiple points with a single value and confirms the changes."""
@@ -2934,10 +3015,10 @@ class TestGetMultiplePoints:
         return base_PDA
 
     def test_get_multiple_points_with_single_path(self, PDA):
-        """Test get_multiple_points with a single path"""
+        """A device topic alone reads every point beneath it as a pattern query."""
         PDA.get_multiple_points(path='device1')
-        PDA.get.assert_called_once_with({'device1'})
-        PDA._equipment_id.assert_not_called()
+        PDA._equipment_id.assert_called_once_with('device1')
+        PDA.get.assert_called_once_with(topic='device1/point1')
 
     def test_get_multiple_points_with_single_path_and_point_names(self, PDA):
         """Test get_multiple_points with a single path and point names."""
@@ -2964,9 +3045,9 @@ class TestSetMultiplePoints:
         base_PDA.vip.rpc.context = MagicMock()
         base_PDA.vip.rpc.context.vip_message.peer = self.sender
 
-        # Mock `_equipment_id` to return different values for multiple points
+        # Mock `_equipment_id`: the first call resolves the device (driver-style detection), the rest the points.
         base_PDA._equipment_id = Mock(
-            side_effect=['device1/point1', 'device1/point2', 'device2/point1']
+            side_effect=['devices/device1', 'device1/point1', 'device1/point2', 'device2/point1']
         )
 
         # Mock `set` method to return a specific response
@@ -2982,6 +3063,7 @@ class TestSetMultiplePoints:
             'device1/point1': 100,
             'device1/point2': 200
         },
+                                        topic=['device1/point1', 'device1/point2'],
                                         map_points=True)
         PDA._equipment_id.assert_any_call('device1', 'point1')
         PDA._equipment_id.assert_any_call('device1', 'point2')
@@ -3004,6 +3086,7 @@ class TestSetMultiplePoints:
             'device1/point1': 100,
             'device1/point2': 200
         },
+                                        topic=['device1/point1', 'device1/point2'],
                                         map_points=True,
                                         some_key='some_value')
         PDA._equipment_id.assert_any_call('device1', 'point1')
@@ -3111,9 +3194,9 @@ class TestPDARevertPoint:
 
         PDA.revert_point(path, point_name, topic=topic)
 
-        # Assert that revert_point was called on the remote with the correct equip_id
+        # The topic keyword selects the point and is not forwarded to the interface (which takes its own topic arg).
         PDA._equipment_id.assert_called_once_with(topic, None)
-        mock_remote.revert_point.assert_called_once_with(equip_id, topic=topic)
+        mock_remote.revert_point.assert_called_once_with(equip_id)
 
 
 class TestPDARevertDevice:
@@ -3788,3 +3871,249 @@ class TestHandleUnknownReservationError:
 
 if __name__ == '__main__':
     pytest.main()
+
+
+class TestPDALegacyRpcArgumentShapes:
+    """The legacy RPC methods accept both the monolithic driver's and the monolithic actuator's argument shapes."""
+
+    DEVICE = 'campus/b/dev'
+    KNOWN = {'devices/campus/b/dev', 'devices/campus/b/dev/p1', 'devices/campus/b/dev/p2'}
+
+    @pytest.fixture
+    def PDA(self, base_PDA):
+        tree = base_PDA.equipment_tree
+        tree.root = 'devices'
+
+        def get_node(nid):
+            if nid in self.KNOWN:
+                return Mock(identifier=nid)
+            return None
+        tree.get_node = Mock(side_effect=get_node)
+        tree.raise_on_locks = Mock()
+        base_PDA.remote = Mock()
+        tree.get_remote = Mock(return_value=base_PDA.remote)
+        base_PDA.vip.rpc.context.vip_message.peer = 'caller'
+        base_PDA.get = MagicMock(return_value=({}, {}))
+        base_PDA.set = MagicMock(return_value=({}, {}))
+        base_PDA.revert = MagicMock(return_value={})
+        return base_PDA
+
+    P1 = 'devices/campus/b/dev/p1'
+
+    # ---- get_point -------------------------------------------------------------------------------------------------
+    @pytest.mark.parametrize('args, kwargs', [
+        ((DEVICE, 'p1'), {}),                                   # driver positional
+        ((), {'path': DEVICE, 'point_name': 'p1'}),             # driver keywords
+        ((f'{DEVICE}/p1',), {}),                                # actuator combined topic
+        ((DEVICE, 'p1'), {}),                                   # actuator (topic, point) -- same as driver form
+        ((), {'topic': f'{DEVICE}/p1'}),                        # actuator keyword
+        ((), {'topic': DEVICE, 'point': 'p1'}),                 # actuator keywords, split
+        ((f'{DEVICE}/p1',), {'requester_id': 'ignored'}),       # requester_id accepted and dropped
+    ])
+    def test_get_point_shapes(self, PDA, args, kwargs):
+        PDA.get_point(*args, **kwargs)
+        PDA.remote.get_point.assert_called_once_with(self.P1)
+
+    def test_get_point_forwards_interface_kwargs_only(self, PDA):
+        PDA.get_point(f'{self.DEVICE}/p1', requester_id='x', on_property='presentValue')
+        PDA.remote.get_point.assert_called_once_with(self.P1, on_property='presentValue')
+
+    def test_get_point_unknown_raises(self, PDA):
+        with pytest.raises(ValueError, match='No equipment found'):
+            PDA.get_point(self.DEVICE, 'nope')
+
+    # ---- set_point -------------------------------------------------------------------------------------------------
+    @pytest.mark.parametrize('args, kwargs', [
+        ((DEVICE, 'p1', 5), {}),                                        # driver positional
+        ((), {'path': DEVICE, 'point_name': 'p1', 'value': 5}),         # driver keywords
+        (('someone.else', f'{DEVICE}/p1', 5), {}),                      # actuator, requester_id != sender
+        (('caller', f'{DEVICE}/p1', 5), {}),                            # actuator, requester_id == sender
+        (('someone.else', DEVICE, 5, 'p1'), {}),                        # actuator with positional point
+        (('someone.else', DEVICE, 5), {'point': 'p1'}),                 # actuator with point keyword
+        ((), {'requester_id': 'x', 'topic': f'{DEVICE}/p1', 'value': 5}),   # actuator keywords
+        ((), {'topic': DEVICE, 'point': 'p1', 'value': 5}),
+    ])
+    def test_set_point_shapes(self, PDA, args, kwargs):
+        PDA.set_point(*args, **kwargs)
+        PDA.remote.set_point.assert_called_once_with(self.P1, 5)
+        PDA.equipment_tree.raise_on_locks.assert_called_once()
+        assert PDA.equipment_tree.raise_on_locks.call_args.args[1] == 'caller'   # sender is the VIP peer
+
+    def test_set_point_forwards_interface_kwargs_only(self, PDA):
+        PDA.set_point('someone.else', f'{self.DEVICE}/p1', 5, requester_id='x', priority=8)
+        PDA.remote.set_point.assert_called_once_with(self.P1, 5, priority=8)
+
+    def test_set_point_unknown_reports_driver_reading(self, PDA):
+        with pytest.raises(ValueError, match='devices/campus/b/dev/nope'):
+            PDA.set_point(self.DEVICE, 'nope', 5)
+
+    # ---- revert_point / revert_device -------------------------------------------------------------------------------
+    @pytest.mark.parametrize('args, kwargs', [
+        ((DEVICE, 'p1'), {}),
+        ((), {'path': DEVICE, 'point_name': 'p1'}),
+        (('someone.else', f'{DEVICE}/p1'), {}),
+        (('someone.else', DEVICE, 'p1'), {}),
+        (('someone.else', DEVICE), {'point': 'p1'}),
+        ((), {'requester_id': 'x', 'topic': f'{DEVICE}/p1'}),
+    ])
+    def test_revert_point_shapes(self, PDA, args, kwargs):
+        PDA.revert_point(*args, **kwargs)
+        PDA.remote.revert_point.assert_called_once_with(self.P1)
+        PDA._push_result_topic_pair.assert_called_once()
+        assert PDA._push_result_topic_pair.call_args.args[1] == self.P1
+
+    @pytest.mark.parametrize('args, kwargs', [
+        ((DEVICE,), {}),
+        ((), {'path': DEVICE}),
+        (('someone.else', DEVICE), {}),
+        (('caller', DEVICE), {}),
+        ((), {'requester_id': 'x', 'topic': DEVICE}),
+        (('someone.else',), {'topic': DEVICE}),
+    ])
+    def test_revert_device_shapes(self, PDA, args, kwargs):
+        PDA.revert_device(*args, **kwargs)
+        PDA.revert.assert_called_once_with('devices/campus/b/dev')
+
+    # ---- get_multiple_points ----------------------------------------------------------------------------------------
+    @pytest.mark.parametrize('args, kwargs', [
+        ((DEVICE, ['p1', 'p2']), {}),                                           # driver
+        ((), {'path': DEVICE, 'point_names': ['p1', 'p2']}),
+        (([f'{DEVICE}/p1', [DEVICE, 'p2']],), {}),                              # actuator: topics and [device, point]
+        ((), {'topics': [f'{DEVICE}/p1', (DEVICE, 'p2')], 'requester_id': 'x'}),
+    ])
+    def test_get_multiple_points_shapes(self, PDA, args, kwargs):
+        results, errors = PDA.get_multiple_points(*args, **kwargs)
+        PDA.get.assert_called_once()
+        assert set(PDA.get.call_args.args[0]) == {self.P1, 'devices/campus/b/dev/p2'}
+        assert errors == {}
+
+    def test_get_multiple_points_reports_invalid_topics(self, PDA):
+        _, errors = PDA.get_multiple_points([f'{self.DEVICE}/p1', 42])
+        assert set(PDA.get.call_args.args[0]) == {self.P1}
+        assert list(errors) == ['42']
+
+    # ---- set_multiple_points ----------------------------------------------------------------------------------------
+    EXPECTED_MAP = {'devices/campus/b/dev/p1': 1, 'devices/campus/b/dev/p2': 2}
+
+    @pytest.mark.parametrize('args, kwargs', [
+        ((DEVICE, [('p1', 1), ('p2', 2)]), {}),                                         # driver
+        ((), {'path': DEVICE, 'point_names_values': [('p1', 1), ('p2', 2)]}),
+        (('someone.else', [(f'{DEVICE}/p1', 1), ([DEVICE, 'p2'], 2)]), {}),             # actuator, mixed item shapes
+        (('caller', [(f'{DEVICE}/p1', 1), (f'{DEVICE}/p2', 2)]), {}),
+        ((), {'requester_id': 'x', 'topics_values': [(f'{DEVICE}/p1', 1), ((DEVICE, 'p2'), 2)]}),
+    ])
+    def test_set_multiple_points_shapes(self, PDA, args, kwargs):
+        errors = PDA.set_multiple_points(*args, **kwargs)
+        PDA.set.assert_called_once()
+        value_map = PDA.set.call_args.args[0]
+        assert value_map == self.EXPECTED_MAP
+        assert set(PDA.set.call_args.kwargs['topic']) == set(self.EXPECTED_MAP)
+        assert PDA.set.call_args.kwargs['map_points'] is True
+        assert 'requester_id' not in PDA.set.call_args.kwargs
+        assert errors == {}
+
+    def test_set_multiple_points_reports_invalid_topics(self, PDA):
+        errors = PDA.set_multiple_points('someone.else', [(f'{self.DEVICE}/p1', 1), (7, 2)])
+        assert PDA.set.call_args.args[0] == {self.P1: 1}
+        assert list(errors) == ['7']
+
+    def test_set_multiple_points_requires_items(self, PDA):
+        with pytest.raises(TypeError):
+            PDA.set_multiple_points(self.DEVICE)
+
+    # ---- scrape_all --------------------------------------------------------------------------------------------------
+    @pytest.mark.parametrize('args, kwargs', [((DEVICE,), {}), ((), {'path': DEVICE}), ((), {'topic': DEVICE})])
+    def test_scrape_all_shapes(self, PDA, args, kwargs):
+        PDA.scrape_all(*args, **kwargs)
+        PDA.get.assert_called_once_with(topic='devices/campus/b/dev')
+
+
+class TestPDAInterfaceKwargsForwarding:
+    """Interface-specific keyword arguments (e.g. BACnet priority / on_property) reach the remote from every query API,
+    reads with keywords do not refresh last_value, and the confirming read of a write uses the write's keywords."""
+
+    @pytest.fixture
+    def PDA(self, base_PDA):
+        base_PDA.vip.rpc.context.vip_message.peer = 'caller'
+        base_PDA.remote = MagicMock()
+        base_PDA.remote.get_multiple_points.return_value = ({'devices/d/p1': 1.0}, {})
+        base_PDA.remote.set_multiple_points.return_value = ({'devices/d/p1': 5}, {})
+        base_PDA.point = MagicMock(identifier='devices/d/p1')
+        base_PDA.node = MagicMock(last_value='stale')
+        base_PDA.equipment_tree.root = 'devices'
+        base_PDA.equipment_tree.get_node = Mock(return_value=base_PDA.node)
+        base_PDA.equipment_tree.raise_on_locks = Mock()
+        base_PDA.build_query_plan = MagicMock(return_value={base_PDA.remote: {base_PDA.point}})
+        base_PDA.semantic_query = MagicMock(return_value=['devices/d/p1'])
+        return base_PDA
+
+    # ---- reads ---------------------------------------------------------------------------------------------------
+    def test_get_forwards_read_kwargs_and_leaves_last_value(self, PDA):
+        PDA.get(topic='d', on_property='object-name')
+        PDA.remote.get_multiple_points.assert_called_once_with(['devices/d/p1'], on_property='object-name')
+        assert PDA.node.last_value == 'stale'
+
+    def test_get_without_kwargs_updates_last_value(self, PDA):
+        PDA.get(topic='d')
+        PDA.remote.get_multiple_points.assert_called_once_with(['devices/d/p1'])
+        assert PDA.node.last_value == 1.0
+
+    def test_semantic_get_forwards_read_kwargs(self, PDA):
+        PDA.semantic_get('query', on_property='object-name')
+        PDA.remote.get_multiple_points.assert_called_once_with(['devices/d/p1'], on_property='object-name')
+
+    @pytest.mark.parametrize('call', [
+        lambda PDA: PDA.get_multiple_points('d', ['p1'], on_property='object-name'),
+        lambda PDA: PDA.get_multiple_points(['d/p1'], on_property='object-name'),
+        lambda PDA: PDA.get_multiple_points('d', on_property='object-name'),                 # device-only read
+        lambda PDA: PDA.scrape_all('d', on_property='object-name'),
+    ])
+    def test_legacy_reads_forward_kwargs(self, PDA, call):
+        call(PDA)
+        PDA.remote.get_multiple_points.assert_called_once_with(['devices/d/p1'], on_property='object-name')
+
+    # ---- writes --------------------------------------------------------------------------------------------------
+    def test_set_forwards_write_kwargs_to_write_and_confirm_read(self, PDA):
+        # The confirming read must address the same thing the write did (e.g. the same BACnet property), so it gets
+        # the same keywords; the interface drops those that mean nothing for a read (e.g. priority).
+        PDA.set(5, topic='d', confirm_values=True, priority=8, on_property='relinquish-default')
+        PDA.remote.set_multiple_points.assert_called_once_with([('devices/d/p1', 5)], priority=8,
+                                                               on_property='relinquish-default')
+        PDA.remote.get_multiple_points.assert_called_once_with(['devices/d/p1'], priority=8,
+                                                               on_property='relinquish-default')
+
+    def test_semantic_set_forwards_write_kwargs(self, PDA):
+        PDA.semantic_set(5, 'query', priority=8)
+        PDA.remote.set_multiple_points.assert_called_once_with([('devices/d/p1', 5)], priority=8)
+
+    @pytest.mark.parametrize('call', [
+        lambda PDA: PDA.set_multiple_points('d', [('p1', 5)], priority=8),                           # driver style
+        lambda PDA: PDA.set_multiple_points('someone', [('d/p1', 5)], priority=8),                   # actuator style
+        lambda PDA: PDA.set_multiple_points(topics_values=[('d/p1', 5)], requester_id='x', priority=8),
+    ])
+    def test_legacy_set_multiple_points_forwards_kwargs(self, PDA, call):
+        # build_query_plan is mocked; the legacy method must still hand the remote the write option, not requester_id.
+        def get_node(nid):
+            return PDA.node if nid in ('devices/d', 'devices/d/p1') else None
+        PDA.equipment_tree.get_node = Mock(side_effect=get_node)
+        call(PDA)
+        PDA.remote.set_multiple_points.assert_called_once()
+        assert PDA.remote.set_multiple_points.call_args.kwargs == {'priority': 8}
+
+    # ---- reverts -------------------------------------------------------------------------------------------------
+    def test_revert_forwards_kwargs(self, PDA):
+        PDA.revert(topic='d', priority=8)
+        PDA.remote.revert_point.assert_called_once_with('devices/d/p1', priority=8)
+
+    def test_semantic_revert_forwards_kwargs(self, PDA):
+        PDA.semantic_revert('query', priority=8)
+        PDA.remote.revert_point.assert_called_once_with('devices/d/p1', priority=8)
+
+    @pytest.mark.parametrize('call', [
+        lambda PDA: PDA.revert_device('d', priority=8),
+        lambda PDA: PDA.revert_device('someone', 'd', priority=8),
+        lambda PDA: PDA.revert_device(topic='d', requester_id='x', priority=8),
+    ])
+    def test_legacy_revert_device_forwards_kwargs(self, PDA, call):
+        call(PDA)
+        PDA.remote.revert_point.assert_called_once_with('devices/d/p1', priority=8)

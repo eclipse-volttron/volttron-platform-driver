@@ -47,6 +47,22 @@ features intended to make polling more scalable, flexible, and efficient:
   should not share its remote with other devices.
 * Last known values and times at which these were obtained are stored
   in a data model and can be retrieved with the "last" RPC method.
+* A 'Data Source' registry column says how each point gets its value, and so how it is scheduled:
+  `short_poll` (the default) points share the device group's regular cyclic schedule; `long_poll` points
+  (totals, configuration registers) are polled at their own interval in a separate schedule, so a very
+  long interval does not stretch the hyperperiod of the regular one; `poll_once` points (nameplate data)
+  are read once when the device is configured or reconfigured; `static` points are never read from the
+  device (their value is configuration or whatever was last written); `never_poll` points are never
+  polled but still take values from pushes (change of value, unsolicited responses) and explicit gets;
+  and `server` points are the served points of a device in a server role, written by the platform and by
+  the remote peer and never polled. Points which are not polled cyclically become stale only when a
+  configured "stale_timeout" has passed since their last update (`static` points never do).
+* The values of `server` points are kept across restarts of the platform driver in the agent's own
+  configuration store, one entry per device named `state/<device topic>` holding `{point: value}`
+  (inspect it with `vctl config get`; do not edit it while the driver runs). Writes are coalesced to one
+  per device per `served_state_flush_interval` seconds (default 5) and on shutdown; the entry is read into
+  the equipment tree before the device registers with its protocol proxy, so the registration carries the
+  values to the proxy, and it is deleted when the device is removed.
 
 #### Publication Changes
 As the direct result of the new capability for points to have different polling rates,
@@ -252,6 +268,29 @@ compatability and will work the same as the name in the key of this dictionary.
   "timezone":"UTC",  # The timezone to use in pulbish meta-data.
 }
 ```
+
+## Securing device writes
+
+By default, every agent that is authenticated to the message bus can call the Platform Driver's write methods
+(`set_point`, `set_multiple_points`, `revert_point`, `revert_device`, `set_override_on` and `set_override_off`),
+whatever capabilities it has otherwise been granted. This default is kept for compatibility with existing
+deployments, but it means that any compromised or misbehaving agent on the platform can actuate every device the
+driver controls. **Operators are strongly recommended to protect these methods** by requiring authorization for them
+and granting it only to the agents that are meant to write to devices:
+
+```bash
+# Require authorization for the write methods of the Platform Driver.
+vctl authz add agent platform.driver --protected-rpcs set_point set_multiple_points revert_point revert_device set_override_on set_override_off
+
+# Create a role carrying the write capabilities and assign it to the agents that need them.
+vctl authz add role device_writer --rpc-capabilities platform.driver.set_point platform.driver.set_multiple_points platform.driver.revert_point platform.driver.revert_device
+vctl authz add agent my.control.agent --role-names device_writer
+```
+
+Replace `platform.driver` with the driver's VIP identity if it has been changed, and list only the methods each
+role actually needs. Calls to a protected method from an agent without the matching capability are refused by the
+platform's authorization service. Reads (`get_point`, `get_multiple_points`, `scrape_all`) may be protected in the
+same way where device data is sensitive.
 
 # Development
 

@@ -80,6 +80,8 @@ class PlatformDriverConfig(BaseModel):
     reservation_required_for_write_configured: bool = Field(default=False, alias='reservation_required_for_write')
     scalability_test: bool = False
     scalability_test_iterations: int = 3
+    # Seconds between writes of a served device's values to the configuration store (state/<device>); see served_state.
+    served_state_flush_interval: float = 5.0
     stale_timeout_configured: Annotated[float | None, empty_str_is(None)] = Field(default=None, alias='stale_timeout')
     stale_timeout_multiplier: Annotated[float, empty_str_is(3.0)] = Field(default=3.0)
     strict_all_publishes: bool = False

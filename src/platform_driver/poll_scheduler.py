@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from importlib.metadata import distribution, PackageNotFoundError
 from functools import reduce
 from math import floor, gcd, lcm
-from typing import Any
+from typing import Any, Iterable
 from weakref import WeakKeyDictionary, WeakValueDictionary
 
 try:
@@ -46,6 +46,8 @@ except PackageNotFoundError:
     from volttron.platform.vip.agent.core import ScheduledEvent
     from volttron.driver.base.driver import DriverAgent
     from volttron.platform.agent.utils import get_aware_utc_now
+
+from volttron.driver.base.config import DataSource
 
 from .config import GroupConfig
 from .equipment import EquipmentTree, PointNode
@@ -128,7 +130,43 @@ class PollSet:
 
 
 class PollScheduler(metaclass=abc.ABCMeta):
+    """Builds and runs the polling schedule for one group.
+
+    Which points are scheduled, and where, follows each point's ``data_source`` (:class:`DataSource`):
+
+    * ``SHORT_POLL`` points go into ``poll_sets`` and share the group's regular cyclic schedule;
+    * ``LONG_POLL`` points go into ``long_poll_sets`` and get their own slot plan(s), so a very long interval does not
+      stretch the hyperperiod of the regular schedule;
+    * ``POLL_ONCE`` points are never in a cyclic schedule; :meth:`one_shot_poll_sets` collects them so the agent can
+      read them once at start-up and whenever they are (re)configured;
+    * ``STATIC``, ``NEVER_POLL`` and ``SERVER`` points are never polled by the scheduler.
+
+    Both ``poll_sets`` dictionaries are ``{group: {remote: {interval: PollSet}}}``.
+    """
     poll_sets: dict[str, WeakKeyDictionary[DriverAgent, dict[float, PollSet]]] = defaultdict(WeakKeyDictionary)
+    long_poll_sets: dict[str, WeakKeyDictionary[DriverAgent, dict[float, PollSet]]] = defaultdict(WeakKeyDictionary)
+
+    @classmethod
+    def _sets_for(cls, point: PointNode) -> dict | None:
+        """The class-level poll-set dictionary a point belongs in, or None when the point is never scheduled."""
+        data_source = point.data_source
+        if data_source is DataSource.LONG_POLL:
+            return cls.long_poll_sets
+        if isinstance(data_source, DataSource) and not data_source.scheduled:
+            return None
+        return cls.poll_sets
+
+    @classmethod
+    def one_shot_poll_sets(cls, data_model: EquipmentTree, points: Iterable[PointNode] | None = None
+                           ) -> list[PollSet]:
+        """One PollSet per remote of the active ``POLL_ONCE`` points among ``points`` (all points when None)."""
+        points = data_model.points() if points is None else points
+        by_remote: dict[DriverAgent, PollSet] = {}
+        for point in points:
+            if point.data_source is DataSource.POLL_ONCE and data_model.is_active(point.identifier):
+                remote = data_model.get_remote(point.identifier)
+                by_remote.setdefault(remote, PollSet(data_model, remote)).add(point)
+        return list(by_remote.values())
 
     def __init__(self, data_model: EquipmentTree, group: str, group_config: GroupConfig, **kwargs):
         self.data_model: EquipmentTree = data_model
@@ -156,7 +194,7 @@ class PollScheduler(metaclass=abc.ABCMeta):
     def create_poll_schedulers(cls, data_model: EquipmentTree, group_configs,
                                specific_groups: list[str] = None, existing_group_count: int = 0):
         poll_schedulers = {}
-        groups = specific_groups if specific_groups else cls.poll_sets
+        groups = specific_groups if specific_groups else list(cls.poll_sets.keys() | cls.long_poll_sets.keys())
         for i, group in enumerate(groups):
             group_config = group_configs.get(group)
             if group_config is None:
@@ -173,26 +211,29 @@ class PollScheduler(metaclass=abc.ABCMeta):
 
     @classmethod
     def _build_poll_sets(cls, data_model: EquipmentTree):
-        _log.debug(f'@@@@@@ IN BUILD POLL SETS @@@@@')
         for remote in data_model.remotes.values():
-            _log.debug(f'@@@@@@ REMOTE: {remote.unique_id}')
-            poll_sets = defaultdict(dict)
-            groups = set()
+            # {target poll-set dictionary (short or long): {group: {interval: PollSet}}}
+            poll_sets: dict[int, dict] = {id(cls.poll_sets): defaultdict(dict), id(cls.long_poll_sets): defaultdict(dict)}
+            targets = {id(cls.poll_sets): cls.poll_sets, id(cls.long_poll_sets): cls.long_poll_sets}
             for point in remote.point_set:
-                if data_model.is_active(point.identifier):
-                    group = data_model.get_group(point.identifier)
-                    interval = data_model.get_polling_interval(point.identifier)
-                    if interval not in poll_sets[group]:
-                        poll_sets[group][interval] = PollSet(data_model, remote)
-                    poll_sets[group][interval].add(point)
-                    groups.add(group)
-            _log.debug(f'@@@@@@ POLL_SETS BEFORE GROUP LOOP IS: {poll_sets}')
-            for group in poll_sets:
-                if remote not in cls.poll_sets[group]:
-                    cls.poll_sets[group][remote] = defaultdict(lambda: PollSet(data_model, remote))
-                for interval in poll_sets[group]:
-                    cls.poll_sets[group][remote][interval] = poll_sets[group][interval]
-        _log.debug("@@@@@@ CLS.POLL_SETS AFTER ALL LOOPS IS: {}".format({k0: {k1.unique_id: [k2 for k2 in v1.keys()] for k1, v1 in v0.items()} for k0, v0 in cls.poll_sets.items()}))
+                if (target := cls._sets_for(point)) is None or not data_model.is_active(point.identifier):
+                    continue        # never polled, or polled only once (see one_shot_poll_sets), or inactive
+                group = data_model.get_group(point.identifier)
+                interval = data_model.get_polling_interval(point.identifier)
+                sets = poll_sets[id(target)]
+                if interval not in sets[group]:
+                    sets[group][interval] = PollSet(data_model, remote)
+                sets[group][interval].add(point)
+            for key, sets in poll_sets.items():
+                target = targets[key]
+                for group in sets:
+                    if remote not in target[group]:
+                        target[group][remote] = defaultdict(lambda: PollSet(data_model, remote))
+                    for interval in sets[group]:
+                        target[group][remote][interval] = sets[group][interval]
+        _log.debug('Poll sets: short {}, long {}'.format(
+            *({k0: {k1.unique_id: list(v1.keys()) for k1, v1 in v0.items()} for k0, v0 in sets.items()}
+              for sets in (cls.poll_sets, cls.long_poll_sets))))
 
     @staticmethod
     def find_starting_datetime(now: datetime, interval: timedelta, group_delay: timedelta = None):
@@ -218,37 +259,49 @@ class PollScheduler(metaclass=abc.ABCMeta):
     #     return midnight + next_from_midnight + group_delay
 
     @classmethod
-    def add_to_schedule(cls, point: PointNode, data_model: EquipmentTree):
-        """Add a poll to the schedule, without complete rescheduling if possible"""
+    def add_to_schedule(cls, point: PointNode, data_model: EquipmentTree) -> bool:
+        """Add a poll to the schedule, without complete rescheduling if possible.
+        Returns whether the group has to be rescheduled. Points that are never polled cyclically are not added."""
+        if (sets := cls._sets_for(point)) is None:
+            return False
         group = data_model.get_group(point.identifier)
         remote = data_model.get_remote(point.identifier)
         interval = data_model.get_polling_interval(point.identifier)
-        reschedule_required = (group not in cls.poll_sets
-                               or remote not in cls.poll_sets[group]
-                               or interval not in cls.poll_sets[group][remote])
-        if remote not in cls.poll_sets[group].keys():
-            cls.poll_sets[group][remote] = defaultdict(lambda: PollSet(data_model, remote))
-        cls.poll_sets[group][remote][interval].add(point)
+        reschedule_required = (group not in sets
+                               or remote not in sets[group]
+                               or interval not in sets[group][remote])
+        if remote not in sets[group].keys():
+            sets[group][remote] = defaultdict(lambda: PollSet(data_model, remote))
+        sets[group][remote][interval].add(point)
         return reschedule_required
 
     @classmethod
-    def remove_from_schedule(cls, point: PointNode, data_model: EquipmentTree):
-        """Remove a poll from the schedule without rescheduling."""
+    def remove_from_schedule(cls, point: PointNode, data_model: EquipmentTree) -> bool:
+        """Remove a poll from the schedule without rescheduling. False if the point was not scheduled."""
         group = data_model.get_group(point.identifier)
         remote = data_model.get_remote(point.identifier)
         interval = data_model.get_polling_interval(point.identifier)
-        success = cls.poll_sets[group][remote][interval].remove(point)
-        cls._prune_poll_sets(group, interval, remote)
-        return True if success else False
+        success = False
+        # Look wherever it may be: the point's data_source may have changed since it was scheduled.
+        if group in cls.poll_sets:
+            poll_set = cls.poll_sets[group].get(remote, {}).get(interval)
+            success = bool(poll_set is not None and poll_set.remove(point))
+            cls._prune_poll_sets(group, interval, remote)
+        if group in cls.long_poll_sets:
+            poll_set = cls.long_poll_sets[group].get(remote, {}).get(interval)
+            success = bool(poll_set is not None and poll_set.remove(point)) or success
+            cls._prune_poll_sets(group, interval, remote, cls.long_poll_sets)
+        return success
 
     @classmethod
-    def _prune_poll_sets(cls, group, interval, remote):
-        if not cls.poll_sets[group][remote][interval].points:
-            cls.poll_sets[group][remote].pop(interval)
-            if not cls.poll_sets[group][remote]:
-                cls.poll_sets[group].pop(remote)
-                if not cls.poll_sets[group]:
-                    cls.poll_sets.pop(group)
+    def _prune_poll_sets(cls, group, interval, remote, sets=None):
+        sets = cls.poll_sets if sets is None else sets
+        if remote in sets[group] and interval in sets[group][remote] and not sets[group][remote][interval].points:
+            sets[group][remote].pop(interval)
+        if remote in sets[group] and not sets[group][remote]:
+            sets[group].pop(remote)
+        if not sets[group]:
+            sets.pop(group)
 
     @abc.abstractmethod
     def _prepare_to_schedule(self):
@@ -352,19 +405,24 @@ class StaticCyclicPollScheduler(PollScheduler):
             yield p
 
     def _prepare_to_schedule(self):
-        group_poll_sets = self.poll_sets[self.group]
-        if self.group_config.parallel_subgroups:
-            for parallel_index, (remote, remote_poll_sets) in enumerate(group_poll_sets.items()):
+        # Long-poll points get slot plans of their own, so their (long) intervals never enter the hyperperiod
+        # calculation of the regular schedule.
+        self.slot_plans = []
+        for group_poll_sets in (self.poll_sets.get(self.group, {}), self.long_poll_sets.get(self.group, {})):
+            if not group_poll_sets:
+                continue
+            if self.group_config.parallel_subgroups:
+                for parallel_index, (remote, remote_poll_sets) in enumerate(group_poll_sets.items()):
+                    input_dict = defaultdict(lambda: defaultdict(list))
+                    for interval, poll_set in remote_poll_sets.items():
+                        input_dict[interval][remote].append(poll_set)
+                    self.slot_plans.append(self._find_slots(input_dict, parallel_index))
+            else:
                 input_dict = defaultdict(lambda: defaultdict(list))
-                for interval, poll_set in remote_poll_sets.items():
-                    input_dict[interval][remote].append(poll_set)
-                self.slot_plans.append(self._find_slots(input_dict, parallel_index))
-        else:
-            input_dict = defaultdict(lambda: defaultdict(list))
-            for remote, remote_poll_sets in group_poll_sets.items():
-                for interval, poll_set in remote_poll_sets.items():
-                    input_dict[interval][remote].append(poll_set)
-            self.slot_plans.append(self._find_slots(input_dict))
+                for remote, remote_poll_sets in group_poll_sets.items():
+                    for interval, poll_set in remote_poll_sets.items():
+                        input_dict[interval][remote].append(poll_set)
+                self.slot_plans.append(self._find_slots(input_dict))
 
     def _schedule_polling(self):
         # TODO: How to fully ensure min_polling_interval? Nothing yet prevents collisions between individual polls in

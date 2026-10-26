@@ -169,8 +169,8 @@ These settings are optional:
     - **interval** - Period (in seconds) on which to poll the device and publish the results. Defaults to 60 seconds.
     - **heart_beat_point** - A Point on the device to toggle as a heartbeat. A point with this ``Volttron
       Point Name`` must exist in the registry.  If this setting is missing, the driver will not send a heart beat signal
-      to the device.  Heart beats are triggered by the :ref:`Actuator Agent <Actuator-Agent>` which must be running to
-      use this feature.
+      to the device.  Heart beats are sent by the driver itself on the ``remote_heartbeat_interval`` configured for the
+      agent.
     - **group** - Group to which this device belongs. (Defaults to 0) --- See :ref:`Device Grouping <Device-Grouping>`.
 
 Device Grouping
@@ -332,6 +332,33 @@ point name:
 
     For additional, non-default publish formats, see :ref:`Device Scalability Settings <Device-Scalability-Settings>`.
 
+Data sources
+^^^^^^^^^^^^
+
+The optional ``Data Source`` registry column (``data_source``) says how a point gets its value, which decides whether
+and how the poll scheduler reads it:
+
+==============  ====================================================================================================
+``short_poll``  Polled at its polling interval in the device group's regular cyclic schedule. The default.
+``long_poll``   Polled at its polling interval in a separate schedule, so that very long intervals (totals,
+                configuration registers) do not stretch the hyperperiod of the regular schedule.
+``poll_once``   Read once when the device is configured or reconfigured (nameplate data), then never polled.
+``static``      Never read from the device. The value is configuration or whatever was last written to the point.
+``never_poll``  Never polled; the value comes from pushes (change of value, unsolicited responses) or explicit gets.
+                ``never`` is accepted as an older spelling.
+``server``      A served point of a device in a server role: written by the platform and by the remote peer, never
+                polled, and seeded when the device registers with its protocol proxy.
+==============  ====================================================================================================
+
+Points which are not polled cyclically have no expected update interval: they count as stale only once a configured
+``stale_timeout`` has passed since their last update, and ``static`` points never do.
+
+The values of ``server`` points are kept across restarts of the platform driver in the agent's configuration store, as
+one entry per device named ``state/<device topic>`` holding ``{point: value}``. Writes are coalesced to one per device
+per ``served_state_flush_interval`` seconds (default 5) and on shutdown. The entry is read into the equipment tree before
+the device registers with its protocol proxy, so the registration carries the values to the proxy, and it is deleted
+when the device is removed. It may be inspected with ``vctl config get`` but must not be edited while the driver runs.
+
 
 Getting Values
 --------------
@@ -377,8 +404,17 @@ the ``set_points_multiple``, sets a batch of points with a single RPC call.
 
 .. warning::
 
-    When points are set by sending requests directly to the Platform Driver Agent, it bypasses the scheduling capability
-    of the :ref:`Actuator <Actuator-Agent>` agent.
+    By default any agent authenticated to the message bus may call these methods, regardless of the capabilities it
+    has been granted, so a compromised or misbehaving agent can actuate every device the driver controls. This default
+    is kept for compatibility with existing deployments. Operators are strongly recommended to require authorization
+    for the write methods and grant it only to the agents that need it::
+
+        vctl authz add agent platform.driver --protected-rpcs set_point set_multiple_points revert_point revert_device set_override_on set_override_off
+        vctl authz add role device_writer --rpc-capabilities platform.driver.set_point platform.driver.set_multiple_points
+        vctl authz add agent my.control.agent --role-names device_writer
+
+    Calls to a protected method from an agent without the matching capability are refused by the platform's
+    authorization service.
 
 Set Point
 ^^^^^^^^^

@@ -74,8 +74,8 @@ class EquipmentNode(TopicNode):
         self.data['config'] = value
 
     @property
-    def group(self) -> str:
-        return self.data['config'].group
+    def polling_group(self) -> str:
+        return self.data['config'].polling_group
 
     @property
     def meta_data(self) -> dict:
@@ -215,7 +215,7 @@ class EquipmentTree(TopicTree):
 
         root_config = self[self.root].data['config']
         root_config.active = True
-        root_config.group = 'default'
+        root_config.polling_group = 'default'
         root_config.polling_interval = agent.config.default_polling_interval
         root_config.publish_single_depth = agent.config.publish_single_depth
         root_config.publish_single_breadth = agent.config.publish_single_breadth
@@ -425,7 +425,7 @@ class EquipmentTree(TopicTree):
         return self.get_device_node(nid).remote
 
     def get_group(self, nid: str) -> str:
-        return self[next(self.rsearch(nid, lambda n: n.group is not None))].group
+        return self[next(self.rsearch(nid, lambda n: n.polling_group is not None))].polling_group
 
     def get_point_topics(self, nid: str) -> tuple[str, str]:
         return nid, '/'.join([self.agent.config.breadth_first_base] + list(reversed(nid.split('/')[1:])))
@@ -468,21 +468,42 @@ class EquipmentTree(TopicTree):
     def is_active(self, nid: str) -> bool:
         return self[next(self.rsearch(nid, lambda n: n.active is not None))].active
 
+    def record_pushed_value(self, point: PointNode):
+        """Called by DriverAgent.publish_push for every value it stores: served points' values are kept in the agent's
+        configuration store across restarts (see served_state)."""
+        store = getattr(self.agent, 'served_state', None)
+        if store is not None:
+            store.record(point)
+
     def is_ready(self, nid: str) -> bool:
         return not any(p.last_updated is None for p in self.points(nid) if self.is_active(p.identifier))
 
     def is_stale(self, nid: str) -> bool:
-        stale_timeout_configured = self.get_stale_timeout_configured(nid)
-        stale_timeout_multiplier = self.get_stale_timeout_multiplier(nid)
-        polling_interval = self.get_polling_interval(nid)
+        """Whether a point's last value is older than its stale timeout.
 
-        if stale_timeout_configured is None and (polling_interval is None or stale_timeout_multiplier is None):
-                stale_timeout = float('inf')
+        A cyclically polled point (``SHORT_POLL``, ``LONG_POLL``) is expected every polling interval, so without a
+        configured ``stale_timeout`` it goes stale after ``stale_timeout_multiplier`` intervals. Nothing else is
+        expected on a schedule: a ``STATIC`` value is never stale, and a ``POLL_ONCE``, ``NEVER_POLL`` or ``SERVER``
+        point is stale only once a configured ``stale_timeout`` has passed since its last update.
+        """
+        node = self.get_node(nid)
+        if node.last_updated is None:
+            return True
+        data_source = getattr(node, 'data_source', DataSource.SHORT_POLL)
+        if data_source is DataSource.STATIC:
+            return False
+        stale_timeout_configured = self.get_stale_timeout_configured(nid)
+        if stale_timeout_configured is not None:
+            stale_timeout = timedelta(seconds=stale_timeout_configured)
+        elif data_source.scheduled:
+            stale_timeout_multiplier = self.get_stale_timeout_multiplier(nid)
+            polling_interval = self.get_polling_interval(nid)
+            stale_timeout = (timedelta(seconds=polling_interval * stale_timeout_multiplier)
+                             if polling_interval is not None and stale_timeout_multiplier is not None
+                             else timedelta.max)
         else:
-            stale_timeout = timedelta(seconds=(stale_timeout_configured
-                                               if stale_timeout_configured is not None
-                                               else polling_interval * stale_timeout_multiplier))
-        return True if get_aware_utc_now() - self.get_node(nid).last_updated > stale_timeout else False
+            stale_timeout = timedelta.max
+        return get_aware_utc_now() - node.last_updated > stale_timeout
 
     def active_points(self, points: EquipmentNode | Iterable[EquipmentNode]) -> Iterable[PointNode]:
         points = self.points(points.identifier) if isinstance(points, EquipmentNode) else points

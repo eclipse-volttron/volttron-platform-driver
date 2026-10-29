@@ -169,8 +169,8 @@ These settings are optional:
     - **interval** - Period (in seconds) on which to poll the device and publish the results. Defaults to 60 seconds.
     - **heart_beat_point** - A Point on the device to toggle as a heartbeat. A point with this ``Volttron
       Point Name`` must exist in the registry.  If this setting is missing, the driver will not send a heart beat signal
-      to the device.  Heart beats are triggered by the :ref:`Actuator Agent <Actuator-Agent>` which must be running to
-      use this feature.
+      to the device.  Heart beats are sent by the driver itself on the ``remote_heartbeat_interval`` configured for the
+      agent.
     - **group** - Group to which this device belongs. (Defaults to 0) --- See :ref:`Device Grouping <Device-Grouping>`.
 
 Device Grouping
@@ -377,8 +377,17 @@ the ``set_points_multiple``, sets a batch of points with a single RPC call.
 
 .. warning::
 
-    When points are set by sending requests directly to the Platform Driver Agent, it bypasses the scheduling capability
-    of the :ref:`Actuator <Actuator-Agent>` agent.
+    By default any agent authenticated to the message bus may call these methods, regardless of the capabilities it
+    has been granted, so a compromised or misbehaving agent can actuate every device the driver controls. This default
+    is kept for compatibility with existing deployments. Operators are strongly recommended to require authorization
+    for the write methods and grant it only to the agents that need it::
+
+        vctl authz add agent platform.driver --protected-rpcs set_point set_multiple_points revert_point revert_device set_override_on set_override_off
+        vctl authz add role device_writer --rpc-capabilities platform.driver.set_point platform.driver.set_multiple_points
+        vctl authz add agent my.control.agent --role-names device_writer
+
+    Calls to a protected method from an agent without the matching capability are refused by the platform's
+    authorization service.
 
 Set Point
 ^^^^^^^^^
